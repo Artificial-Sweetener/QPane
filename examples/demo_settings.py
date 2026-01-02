@@ -57,12 +57,16 @@ def load_demo_settings() -> dict[str, object]:
         return {}
     if data["sam_model_url"] is not None and not isinstance(data["sam_model_url"], str):
         return {}
+    sam_model_hash = data.get("sam_model_hash")
+    if sam_model_hash is not None and not isinstance(sam_model_hash, str):
+        return {}
     settings: dict[str, object] = {
         "tier": data["tier"],
         "log_level": data["log_level"],
         "sam_download_mode": data["sam_download_mode"],
         "sam_model_path": data["sam_model_path"],
         "sam_model_url": data["sam_model_url"],
+        "sam_model_hash": sam_model_hash,
     }
     window_geometry = _coerce_geometry_payload(data.get("window_geometry"))
     if window_geometry is not None:
@@ -82,6 +86,7 @@ def save_demo_settings(
     sam_download_mode: str,
     sam_model_path: str | None,
     sam_model_url: str | None,
+    sam_model_hash: str | None,
     *,
     window_geometry: str | None = None,
     window_size: tuple[int, int] | None = None,
@@ -107,6 +112,7 @@ def save_demo_settings(
         "sam_download_mode": sam_download_mode,
         "sam_model_path": sam_model_path,
         "sam_model_url": sam_model_url,
+        "sam_model_hash": sam_model_hash,
     }
     if window_geometry is not None:
         payload["window_geometry"] = window_geometry

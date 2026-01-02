@@ -109,6 +109,7 @@ class SamConfigSlice:
     sam_device: str = _BASE_CONFIG.sam_device
     sam_model_path: Optional[str] = _BASE_CONFIG.sam_model_path
     sam_model_url: str = _BASE_CONFIG.sam_model_url
+    sam_model_hash: Optional[str] = _BASE_CONFIG.sam_model_hash
     sam_download_mode: str = _BASE_CONFIG.sam_download_mode
     sam_prefetch_depth: Optional[int] = _BASE_CONFIG.sam_prefetch_depth
     sam_cache_limit: int = _BASE_CONFIG.sam_cache_limit
@@ -183,6 +184,7 @@ def _validate_sam_config(slice_obj: SamConfigSlice) -> None:
     _validate_sam_download_mode(slice_obj.sam_download_mode)
     _validate_sam_model_path(slice_obj.sam_model_path)
     _validate_sam_model_url(slice_obj.sam_model_url)
+    _validate_sam_model_hash(slice_obj.sam_model_hash)
     if slice_obj.sam_prefetch_depth is not None and slice_obj.sam_prefetch_depth < 0:
         raise ValueError("sam_prefetch_depth must be non-negative or None")
     if slice_obj.sam_cache_limit < 0:
@@ -220,6 +222,16 @@ def _validate_sam_model_url(url: object) -> None:
         raise ValueError("sam_model_url must be a non-empty string")
     if not url.strip():
         raise ValueError("sam_model_url must be a non-empty string")
+
+
+def _validate_sam_model_hash(hash_value: object) -> None:
+    """Ensure the SAM model hash is either None or a non-empty string."""
+    if hash_value is None:
+        return
+    if not isinstance(hash_value, str):
+        raise ValueError("sam_model_hash must be a string or None")
+    if not hash_value.strip():
+        raise ValueError("sam_model_hash must be a non-empty string when set")
 
 
 def _import_torch():

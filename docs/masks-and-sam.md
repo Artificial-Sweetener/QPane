@@ -123,9 +123,10 @@ Checkpoint controls let you decide *when* the SAM model is fetched and *where* i
     *   `"background"` downloads missing weights after startup so the UI stays responsive.
     *   `"blocking"` blocks app startup until the checkpoint is ready; pair it with a splash screen when you need SAM fully ready the moment the UI appears.
     *   `"disabled"` never downloads; your app must provide the file up front.
-*   **Path vs URL:** `sam_model_path` points at a local checkpoint (for pre-provisioned models or shared caches). `sam_model_url` overrides the download source (default: the MobileSAM GitHub weights), while the file is stored under `QStandardPaths.AppDataLocation/mobile_sam.pt` unless you set a custom path.
+*   **Path vs URL:** `sam_model_path` points at a local checkpoint (for pre-provisioned models or shared caches). `sam_model_url` overrides the download source; when unset, QPane uses the MobileSAM GitHub weights and stores them under `QStandardPaths.AppDataLocation/mobile_sam.pt` unless you set a custom path.
+*   **Hash Verification:** `sam_model_hash` lets you supply a SHA-256 checksum for the checkpoint; set it to `"default"` to use the built-in MobileSAM hash. When the default URL is used and `sam_model_path` is unset, the built-in hash is enforced after downloads. Custom URLs without a hash log a warning and are downloaded without integrity verification.
 *   **Preflight Behavior:** When downloads are enabled, QPane checks for the file at startup and fetches it if missing; disabled mode requires the file to exist already.
-*   **Readiness + Progress:** Connect to `QPane.samCheckpointStatusChanged` (`"downloading"`, `"ready"`, `"failed"`, `"missing"`) and `QPane.samCheckpointProgress` (`downloaded`, `total`) to drive UI state or show progress.
+*   **Readiness + Progress:** Connect to `QPane.samCheckpointStatusChanged` (`"downloading"`, `"ready"`, `"failed"`, `"missing"`) and `QPane.samCheckpointProgress` (`downloaded`, `total`) to drive UI state or show progress; `"downloading"` also covers integrity verification when a hash is required.
 *   **Runtime Helpers:** `QPane.samCheckpointReady()` and `QPane.samCheckpointPath()` let you gate predictor work. Use `QPane.refreshSamFeature()` when checkpoint-related configuration changes need to reinitialize SAM.
 
 For the complete SAM setting list and defaults, see [Configuration Reference](configuration-reference.md).

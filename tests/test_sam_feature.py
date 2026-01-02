@@ -233,9 +233,15 @@ def test_install_sam_feature_background_download_signals(monkeypatch, qapp, tmp_
     initial_checkpoint.write_bytes(b"ready")
 
     def fake_ensure_checkpoint(
-        checkpoint_path, *, download_mode, model_url, progress_callback=None
+        checkpoint_path,
+        *,
+        download_mode,
+        model_url,
+        expected_hash=None,
+        progress_callback=None,
     ):
         assert download_mode == "background"
+        assert expected_hash is None
         if progress_callback is not None:
             progress_callback(5, 10)
         checkpoint_path.write_bytes(b"checkpoint")

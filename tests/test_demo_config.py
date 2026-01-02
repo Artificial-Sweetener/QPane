@@ -360,6 +360,7 @@ def test_config_dialog_hides_sam_fields_when_mask_only(qapp):
         assert "sam_download_mode" not in dialog._widgets
         assert "sam_model_path" not in dialog._widgets
         assert "sam_model_url" not in dialog._widgets
+        assert "sam_model_hash" not in dialog._widgets
     finally:
         dialog.close()
         dialog.deleteLater()

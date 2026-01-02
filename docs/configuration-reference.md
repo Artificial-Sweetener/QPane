@@ -92,6 +92,7 @@ config = {
     "sam_device": "cpu",  # SAM device string (e.g., "cpu", "cuda", "mps" when available).
     "sam_model_path": None,  # Local checkpoint path; overrides download when set.
     "sam_model_url": "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt",  # Download URL when path not set.
+    "sam_model_hash": None,  # Optional SHA-256 checksum; use "default" for the built-in hash.
     "sam_download_mode": "background",  # One of "blocking", "background", "disabled".
     "sam_prefetch_depth": None,  # Predictor prefetch depth; None inherits cache.prefetch.predictors.
     "sam_cache_limit": 1,  # Max cached SAM predictors/embeddings kept in RAM.

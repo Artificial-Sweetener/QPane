@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 
 _PSUTIL_WARNING_EMITTED = False
 
+SAM_DEFAULT_MODEL_URL = (
+    "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt"
+)
+SAM_DEFAULT_MODEL_HASH = (
+    "6dbb90523a35330fedd7f1d3dfc66f995213d81b29a5ca8108dbcdd4e37d6c2f"
+)
+
 
 def _warn_psutil_missing() -> None:
     """Log once when psutil is unavailable so Auto mode can fall back cleanly."""
@@ -589,7 +596,8 @@ _DEFAULTS: dict[str, Any] = {
     "draw_tile_grid": False,
     "sam_device": "cpu",
     "sam_model_path": None,
-    "sam_model_url": "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt",
+    "sam_model_url": SAM_DEFAULT_MODEL_URL,
+    "sam_model_hash": None,
     "sam_download_mode": "background",
     "sam_prefetch_depth": None,
     "sam_cache_limit": 1,

@@ -134,6 +134,10 @@ def _parse_bootstrap_args(argv: list[str]) -> argparse.Namespace:
         "--sam-model-url",
         default=None,
     )
+    parser.add_argument(
+        "--sam-model-hash",
+        default=None,
+    )
     return parser.parse_args(argv)
 
 
@@ -203,6 +207,7 @@ def _launch_in_venv(
     sam_download_mode: str | None = None,
     sam_model_path: str | None = None,
     sam_model_url: str | None = None,
+    sam_model_hash: str | None = None,
 ) -> int:
     """Spawn the demo using the tier-specific venv and feature selection."""
     python_bin = _venv_python(tier)
@@ -225,6 +230,8 @@ def _launch_in_venv(
         cmd.extend(["--sam-model-path", sam_model_path])
     if tier == "masksam" and sam_model_url:
         cmd.extend(["--sam-model-url", sam_model_url])
+    if tier == "masksam" and sam_model_hash:
+        cmd.extend(["--sam-model-hash", sam_model_hash])
     return subprocess.call(cmd)
 
 
@@ -240,6 +247,7 @@ def _interactive_menu() -> int:
     default_sam_mode = saved.get("sam_download_mode", "background")
     default_sam_path = saved.get("sam_model_path")
     default_sam_url = saved.get("sam_model_url")
+    default_sam_hash = saved.get("sam_model_hash")
     try:
         tier_idx = tiers.index(default_tier)
     except ValueError:
@@ -258,6 +266,7 @@ def _interactive_menu() -> int:
         "sam_idx": sam_idx,
         "sam_model_path": default_sam_path,
         "sam_model_url": default_sam_url,
+        "sam_model_hash": default_sam_hash,
         "sam_clear_checkpoint": False,
     }
 
@@ -343,6 +352,18 @@ def _interactive_menu() -> int:
                     "value": _format_optional_value(state["sam_model_url"]),
                     "help": (
                         "Set a download URL override. Enter to edit, blank to use default."
+                    ),
+                }
+            )
+            rows.append(
+                {
+                    "kind": "input",
+                    "key": "sam_model_hash",
+                    "label": "SAM Hash",
+                    "value": _format_optional_value(state["sam_model_hash"]),
+                    "help": (
+                        "Set SHA-256 for the checkpoint. Use 'default' to force the "
+                        "built-in hash, or blank to skip verification."
                     ),
                 }
             )
@@ -493,11 +514,12 @@ def _interactive_menu() -> int:
                 sam_mode = sam_modes[state["sam_idx"]]
                 sam_path = state["sam_model_path"]
                 sam_url = state["sam_model_url"]
+                sam_hash = state["sam_model_hash"]
                 if tier == "masksam" and state["sam_clear_checkpoint"]:
                     checkpoint_path = _resolve_sam_checkpoint_path(sam_path)
                     if checkpoint_path is not None:
                         _clear_sam_checkpoint(checkpoint_path)
-                save_demo_settings(tier, level, sam_mode, sam_path, sam_url)
+                save_demo_settings(tier, level, sam_mode, sam_path, sam_url, sam_hash)
                 try:
                     _ensure_venv_ready(tier, skip_install_if_present=True)
                     return _launch_in_venv(
@@ -506,6 +528,7 @@ def _interactive_menu() -> int:
                         sam_download_mode=sam_mode,
                         sam_model_path=sam_path,
                         sam_model_url=sam_url,
+                        sam_model_hash=sam_hash,
                     )
                 except subprocess.CalledProcessError as exc:
                     print(f"\nError: {exc}")
@@ -516,7 +539,8 @@ def _interactive_menu() -> int:
                 sam_mode = sam_modes[state["sam_idx"]]
                 sam_path = state["sam_model_path"]
                 sam_url = state["sam_model_url"]
-                save_demo_settings(tier, level, sam_mode, sam_path, sam_url)
+                sam_hash = state["sam_model_hash"]
+                save_demo_settings(tier, level, sam_mode, sam_path, sam_url, sam_hash)
                 try:
                     print(f"\nRebuilding {tier} environment...")
                     _ensure_venv_ready(tier, rebuild=True)
@@ -531,7 +555,8 @@ def _interactive_menu() -> int:
                 sam_mode = sam_modes[state["sam_idx"]]
                 sam_path = state["sam_model_path"]
                 sam_url = state["sam_model_url"]
-                save_demo_settings(tier, level, sam_mode, sam_path, sam_url)
+                sam_hash = state["sam_model_hash"]
+                save_demo_settings(tier, level, sam_mode, sam_path, sam_url, sam_hash)
                 return 0
             elif row["key"] == "sam_model_path":
                 state["sam_model_path"] = _prompt_setting(
@@ -540,6 +565,10 @@ def _interactive_menu() -> int:
             elif row["key"] == "sam_model_url":
                 state["sam_model_url"] = _prompt_setting(
                     "SAM model URL", state["sam_model_url"]
+                )
+            elif row["key"] == "sam_model_hash":
+                state["sam_model_hash"] = _prompt_setting(
+                    "SAM model hash", state["sam_model_hash"]
                 )
 
 
@@ -588,6 +617,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> ExampleOptions:
         default=None,
         help="Override the SAM checkpoint download URL for Mask+SAM demos.",
     )
+    parser.add_argument(
+        "--sam-model-hash",
+        default=None,
+        help=(
+            "Provide a SHA-256 checksum for the SAM checkpoint. "
+            "Use 'default' to request the built-in MobileSAM hash."
+        ),
+    )
     ns = parser.parse_args(list(argv) if argv is not None else None)
     return ExampleOptions(
         feature_set=ns.features,
@@ -596,6 +633,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> ExampleOptions:
         sam_download_mode=ns.sam_download_mode,
         sam_model_path=ns.sam_model_path,
         sam_model_url=ns.sam_model_url,
+        sam_model_hash=ns.sam_model_hash,
     )
 
 
@@ -631,6 +669,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             sam_download_mode=bootstrap.sam_download_mode,
             sam_model_path=bootstrap.sam_model_path,
             sam_model_url=bootstrap.sam_model_url,
+            sam_model_hash=bootstrap.sam_model_hash,
         )
     _load_example_types()
     from PySide6.QtGui import QImageReader
@@ -650,6 +689,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             sam_overrides["sam_model_path"] = opts.sam_model_path
         if opts.sam_model_url:
             sam_overrides["sam_model_url"] = opts.sam_model_url
+        if opts.sam_model_hash:
+            sam_overrides["sam_model_hash"] = opts.sam_model_hash
         if sam_overrides:
             config.configure(**sam_overrides)
     window = ExampleWindow(opts, config=config)

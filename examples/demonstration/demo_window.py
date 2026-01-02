@@ -181,6 +181,7 @@ class ExampleOptions:
     sam_download_mode: str | None = None
     sam_model_path: str | None = None
     sam_model_url: str | None = None
+    sam_model_hash: str | None = None
 
 
 class ExampleWindow(QMainWindow):
@@ -292,12 +293,16 @@ class ExampleWindow(QMainWindow):
         sam_model_url = self._resolve_optional_setting(
             self.options.sam_model_url, existing.get("sam_model_url")
         )
+        sam_model_hash = self._resolve_optional_setting(
+            self.options.sam_model_hash, existing.get("sam_model_hash")
+        )
         save_demo_settings(
             self.options.feature_set,
             self.options.log_level,
             sam_download_mode,
             sam_model_path,
             sam_model_url,
+            sam_model_hash,
             window_geometry=window_geometry,
             window_size=(size.width(), size.height()),
             window_position=(position.x(), position.y()),

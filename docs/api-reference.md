@@ -158,7 +158,7 @@ See also: [Diagnostics](diagnostics.md).
 - QPane.samFeatureAvailable — Check whether the SAM feature is installed.
 - QPane.samCheckpointReady — Check whether the resolved SAM checkpoint exists on disk.
 - QPane.samCheckpointPath — Return the resolved SAM checkpoint path when available.
-- QPane.samCheckpointStatusChanged — Signal that reports SAM checkpoint readiness changes (status, path).
+- QPane.samCheckpointStatusChanged — Signal that reports SAM checkpoint readiness changes (status, path); `"downloading"` also covers integrity verification when a hash is required.
 - QPane.samCheckpointProgress — Signal that reports checkpoint download progress (downloaded, total or None).
 - QPane.refreshSamFeature — Reinstall SAM tooling using the current configuration snapshot.
 - QPane.CONTROL_MODE_SMART_SELECT — Built-in smart-select mode using SAM predictions.
@@ -245,7 +245,7 @@ See also: [Catalog and Navigation](catalog-and-navigation.md) and [Interaction M
 - QPane.diagnosticsDomainToggled — `(domain: str, enabled: bool)` payload emitted when a diagnostics domain toggles.
 
 ### SAM
-- QPane.samCheckpointStatusChanged — `(status: str, path: Path)` payload emitted during SAM checkpoint readiness changes (`downloading`, `ready`, `failed`, `missing`).
+- QPane.samCheckpointStatusChanged — `(status: str, path: Path)` payload emitted during SAM checkpoint readiness changes (`downloading`, `ready`, `failed`, `missing`); `"downloading"` also covers integrity verification when a hash is required.
 - QPane.samCheckpointProgress — `(downloaded: int, total: int | None)` payload emitted during SAM checkpoint downloads.
 
 See also: [Catalog and Navigation](catalog-and-navigation.md), [Diagnostics](diagnostics.md), and [Masks and SAM](masks-and-sam.md).

@@ -73,6 +73,7 @@ _SAM_CONFIG_FIELDS: tuple[str, ...] = (
     "sam_download_mode",
     "sam_model_path",
     "sam_model_url",
+    "sam_model_hash",
 )
 
 

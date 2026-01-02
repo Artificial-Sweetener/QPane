@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 from pathlib import Path
+import hashlib
 import numpy as np
 import pytest
 from PySide6.QtCore import QStandardPaths
@@ -164,7 +165,8 @@ def test_resolve_checkpoint_path_accepts_override(tmp_path):
 
 def test_ensure_checkpoint_returns_existing_file(tmp_path, monkeypatch):
     checkpoint = tmp_path / "mobile_sam.pt"
-    checkpoint.write_bytes(b"ready")
+    payload = b"ready"
+    checkpoint.write_bytes(payload)
     called = False
 
     def fake_urlopen(_url):
@@ -173,10 +175,12 @@ def test_ensure_checkpoint_returns_existing_file(tmp_path, monkeypatch):
         raise AssertionError("download should not be invoked")
 
     monkeypatch.setattr(service.urllib.request, "urlopen", fake_urlopen)
+    expected_hash = hashlib.sha256(payload).hexdigest()
     resolved = service.ensure_checkpoint(
         checkpoint,
         download_mode="blocking",
         model_url="https://example.invalid/sam.pt",
+        expected_hash=expected_hash,
     )
     assert resolved == checkpoint.resolve()
     assert called is False
@@ -196,6 +200,7 @@ def test_ensure_checkpoint_rejects_disabled_mode(tmp_path):
 def test_ensure_checkpoint_downloads_file(tmp_path, monkeypatch, capsys):
     checkpoint = tmp_path / "mobile_sam.pt"
     payload = b"sam-checkpoint-data"
+    expected_hash = hashlib.sha256(payload).hexdigest()
 
     class _Response:
         def __init__(self, data: bytes):
@@ -227,6 +232,7 @@ def test_ensure_checkpoint_downloads_file(tmp_path, monkeypatch, capsys):
         checkpoint,
         download_mode="blocking",
         model_url="https://example.invalid/sam.pt",
+        expected_hash=expected_hash,
     )
     assert resolved == checkpoint.resolve()
     assert checkpoint.read_bytes() == payload
@@ -239,6 +245,7 @@ def test_ensure_checkpoint_downloads_in_background_with_callback(
 ):
     checkpoint = tmp_path / "mobile_sam.pt"
     payload = b"sam-checkpoint-data"
+    expected_hash = hashlib.sha256(payload).hexdigest()
 
     class _Response:
         def __init__(self, data: bytes):
@@ -275,6 +282,7 @@ def test_ensure_checkpoint_downloads_in_background_with_callback(
         checkpoint,
         download_mode="background",
         model_url="https://example.invalid/sam.pt",
+        expected_hash=expected_hash,
         progress_callback=record_progress,
     )
     assert resolved == checkpoint.resolve()
@@ -298,3 +306,43 @@ def test_ensure_checkpoint_cleans_up_failed_download(tmp_path, monkeypatch):
             model_url="https://example.invalid/sam.pt",
         )
     assert not part_path.exists()
+
+
+def test_ensure_checkpoint_rejects_mismatched_hash(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "mobile_sam.pt"
+    payload = b"sam-checkpoint-data"
+
+    class _Response:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._offset = 0
+            self.headers = {"Content-Length": str(len(data))}
+
+        def read(self, size: int) -> bytes:
+            if self._offset >= len(self._data):
+                return b""
+            chunk = self._data[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+        def getheader(self, name, default=None):
+            return self.headers.get(name, default)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(_url):
+        return _Response(payload)
+
+    monkeypatch.setattr(service.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(service.SamDependencyError):
+        service.ensure_checkpoint(
+            checkpoint,
+            download_mode="blocking",
+            model_url="https://example.invalid/sam.pt",
+            expected_hash=hashlib.sha256(b"other").hexdigest(),
+        )
+    assert not checkpoint.exists()

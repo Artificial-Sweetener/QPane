@@ -683,6 +683,17 @@ SAM_CHECKPOINT_FIELDS: tuple[FieldSpec, ...] = (
         label="SAM Model URL",
         feature_namespace="sam",
     ),
+    FieldSpec(
+        path="sam_model_hash",
+        kind="line",
+        placeholder="default or sha256",
+        tooltip=(
+            "Optional SHA-256 hash for checkpoint verification; "
+            "use 'default' to apply the built-in MobileSAM hash."
+        ),
+        label="SAM Model Hash",
+        feature_namespace="sam",
+    ),
 )
 DIAGNOSTIC_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec(

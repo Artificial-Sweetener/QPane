@@ -25,6 +25,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable
 import sys
 import urllib.request
+import hashlib
 
 import numpy as np
 from PySide6.QtCore import QStandardPaths
@@ -74,6 +75,7 @@ def ensure_checkpoint(
     *,
     download_mode: str,
     model_url: str,
+    expected_hash: str | None = None,
     progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> Path:
     """Ensure the SAM checkpoint exists, downloading when permitted.
@@ -82,6 +84,7 @@ def ensure_checkpoint(
         checkpoint_path: Optional checkpoint override path.
         download_mode: One of "blocking", "background", or "disabled".
         model_url: Download URL to use when the checkpoint is missing.
+        expected_hash: Optional SHA-256 hex digest used to verify the checkpoint.
         progress_callback: Optional callback invoked with download progress.
 
     Returns:
@@ -109,6 +112,7 @@ def ensure_checkpoint(
         raise SamDependencyError(
             "SAM model URL is not set. Configure sam_model_url or provide sam_model_path."
         )
+    normalized_hash = _normalize_expected_hash(expected_hash)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     _download_checkpoint(model_url, resolved, progress_callback=progress_callback)
     if not resolved.exists():
@@ -116,6 +120,15 @@ def ensure_checkpoint(
             "SAM checkpoint download did not produce the expected file at "
             f"'{resolved}'."
         )
+    if normalized_hash is not None:
+        try:
+            _verify_checkpoint_hash(resolved, normalized_hash)
+        except SamDependencyError:
+            try:
+                resolved.unlink()
+            except OSError:
+                pass
+            raise
     return resolved
 
 
@@ -340,3 +353,36 @@ def _load_model(device: str, checkpoint_path: Path) -> "torch.nn.Module":
     model.to(device=device)
     model.eval()
     return model
+
+
+def _normalize_expected_hash(expected_hash: str | None) -> str | None:
+    """Return a normalized lowercase hash value or ``None`` when unset."""
+    if expected_hash is None:
+        return None
+    normalized = expected_hash.strip().lower()
+    if not normalized:
+        raise SamDependencyError(
+            "SAM model hash must be a non-empty string when provided."
+        )
+    return normalized
+
+
+def _verify_checkpoint_hash(checkpoint_path: Path, expected_hash: str) -> None:
+    """Verify the checkpoint file hash matches the expected digest."""
+    if not checkpoint_path.exists():
+        raise SamDependencyError(f"SAM checkpoint not found at '{checkpoint_path}'.")
+    actual = _hash_file(checkpoint_path)
+    if actual != expected_hash:
+        raise SamDependencyError(
+            "SAM checkpoint hash mismatch. Expected "
+            f"'{expected_hash}' but found '{actual}'."
+        )
+
+
+def _hash_file(path: Path) -> str:
+    """Return the SHA-256 digest for the provided file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -186,3 +186,29 @@ def test_sam_model_path_accepts_pathlike() -> None:
         strict=True,
     )
     assert settings.sam_model_path == Path("checkpoint.pt")
+
+
+def test_sam_model_hash_strict_rejects_empty() -> None:
+    config = Config(sam_model_hash=" ")
+    descriptors = iter_descriptors()
+    with pytest.raises(
+        ValueError, match="Feature 'sam' configuration failed validation"
+    ):
+        FeatureAwareConfig(
+            config,
+            descriptors=descriptors,
+            installed_features=("sam",),
+            strict=True,
+        )
+
+
+def test_sam_model_hash_accepts_default() -> None:
+    config = Config(sam_model_hash="default")
+    descriptors = iter_descriptors()
+    settings = FeatureAwareConfig(
+        config,
+        descriptors=descriptors,
+        installed_features=("sam",),
+        strict=True,
+    )
+    assert settings.sam_model_hash == "default"

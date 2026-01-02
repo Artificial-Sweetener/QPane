@@ -32,6 +32,7 @@ from PySide6.QtCore import QObject, QPoint, QRunnable, Signal
 
 from qpane.types import DiagnosticRecord
 
+from qpane.core.config import SAM_DEFAULT_MODEL_HASH, SAM_DEFAULT_MODEL_URL
 from qpane.core.config_features import require_sam_config
 from qpane.concurrency import BaseWorker, TaskRejected
 
@@ -47,6 +48,8 @@ from qpane.features import FeatureInstallError
 
 
 logger = logging.getLogger(__name__)
+
+_SAM_HASH_WARNING_EMITTED = False
 
 
 if TYPE_CHECKING:
@@ -70,6 +73,7 @@ class _CheckpointDownloadWorker(QRunnable, BaseWorker):
         download_mode: str,
         model_url: str,
         progress_callback: Callable[[int, int | None], None],
+        expected_hash: str | None,
     ) -> None:
         """Store checkpoint inputs and the progress callback."""
         super().__init__()
@@ -78,6 +82,7 @@ class _CheckpointDownloadWorker(QRunnable, BaseWorker):
         self._download_mode = download_mode
         self._model_url = model_url
         self._progress_callback = progress_callback
+        self._expected_hash = expected_hash
         self.signals = _CheckpointDownloadSignals()
 
     def run(self) -> None:
@@ -89,6 +94,7 @@ class _CheckpointDownloadWorker(QRunnable, BaseWorker):
                 self._checkpoint_path,
                 download_mode=self._download_mode,
                 model_url=self._model_url,
+                expected_hash=self._expected_hash,
                 progress_callback=self._progress_callback,
             )
             self.emit_finished(True, payload=self._checkpoint_path)
@@ -136,6 +142,12 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
     sam_device = sam_config.sam_device if device is None else device
     download_mode = str(sam_config.sam_download_mode or "").strip().lower()
     model_url = sam_config.sam_model_url
+    expected_hash = _resolve_expected_hash(
+        sam_config.sam_model_hash,
+        sam_model_path=sam_config.sam_model_path,
+        model_url=model_url,
+    )
+    _warn_on_unverified_custom_url(model_url, expected_hash)
     try:
         checkpoint_path = resolve_checkpoint_path(sam_config.sam_model_path)
     except SamDependencyError as exc:
@@ -162,6 +174,7 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
                 checkpoint_path,
                 download_mode=download_mode,
                 model_url=model_url,
+                expected_hash=expected_hash,
                 progress_callback=_emit_checkpoint_progress,
             )
             _emit_checkpoint_status("ready")
@@ -183,6 +196,7 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
                 download_mode=download_mode,
                 model_url=model_url,
                 progress_callback=_emit_checkpoint_progress,
+                expected_hash=expected_hash,
             )
 
             def _handle_download_finished(path: Path) -> None:
@@ -213,6 +227,7 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
                 checkpoint_path,
                 download_mode="disabled",
                 model_url=model_url,
+                expected_hash=expected_hash,
             )
             _emit_checkpoint_status("ready")
         except SamDependencyError as exc:
@@ -290,6 +305,49 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
 
     tm_signals.region_selected_for_masking.connect(_handle_region_selected)
     tm_signals.mask_component_adjustment_requested.connect(_handle_component_adjustment)
+
+
+def _resolve_expected_hash(
+    raw_hash: object,
+    *,
+    sam_model_path: str | None,
+    model_url: str,
+) -> str | None:
+    """Return the hash to verify for the configured SAM checkpoint settings."""
+    normalized = None
+    if isinstance(raw_hash, str):
+        candidate = raw_hash.strip()
+        if candidate:
+            if candidate.lower() == "default":
+                normalized = SAM_DEFAULT_MODEL_HASH
+            else:
+                normalized = candidate
+    if (
+        normalized is None
+        and sam_model_path is None
+        and model_url == SAM_DEFAULT_MODEL_URL
+    ):
+        normalized = SAM_DEFAULT_MODEL_HASH
+    return normalized
+
+
+def _warn_on_unverified_custom_url(
+    model_url: str,
+    expected_hash: str | None,
+) -> None:
+    """Warn once when a custom model URL is used without hash verification."""
+    global _SAM_HASH_WARNING_EMITTED
+    if _SAM_HASH_WARNING_EMITTED:
+        return
+    if expected_hash is not None:
+        return
+    if model_url == SAM_DEFAULT_MODEL_URL:
+        return
+    logger.warning(
+        "SAM model URL is custom and sam_model_hash is unset; "
+        "checkpoint downloads will not be integrity-checked."
+    )
+    _SAM_HASH_WARNING_EMITTED = True
 
 
 def _sam_summary_diagnostics_provider(qpane: "QPane") -> tuple[DiagnosticRecord, ...]:
