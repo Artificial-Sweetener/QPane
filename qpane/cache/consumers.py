@@ -46,11 +46,9 @@ class _BudgetedCacheConsumer:
         marker_attr: str,
         missing_batch_label: str,
         warn_message: str,
-        hook_messages: dict[str, str],
-        apply_config_message: str,
         pre_trim: Callable[[], None] | None = None,
     ) -> None:
-        """Register manager cache hooks and budgets with the shared coordinator."""
+        """Register manager cache signals and budgets with the shared coordinator."""
         self._manager = manager
         self._coordinator = coordinator
         self._consumer_id = consumer_id
@@ -82,35 +80,50 @@ class _BudgetedCacheConsumer:
                 label=self._limit_label,
             ),
         )
-        self._wrap_cache_hooks(hook_messages)
-        _wrap_manager_hook(
-            self._manager,
-            "apply_config",
-            log_message=apply_config_message,
-            after_success=self._update_preferred_budget,
-        )
+        self._connect_signals()
 
-    def _wrap_cache_hooks(self, hook_messages: dict[str, str]) -> None:
-        """Bind cache mutation hooks so usage stays synchronized."""
-        for name, log_message in hook_messages.items():
-            _wrap_manager_hook(
-                self._manager,
-                name,
-                log_message=log_message,
-                after_finally=self._notify,
-            )
-
-    def _update_preferred_budget(
-        self, _result: Any, _args: tuple[Any, ...], _kwargs: dict[str, Any]
-    ) -> None:
+    def _update_preferred_budget(self, new_limit: int | None = None) -> None:
         """Refresh the preferred budget after config changes apply."""
         self._coordinator.set_consumer_preferred(
             self._consumer_id,
             _safe_int(
-                getattr(self._manager, "cache_limit_bytes", 0),
+                (
+                    new_limit
+                    if new_limit is not None
+                    else getattr(self._manager, "cache_limit_bytes", 0)
+                ),
                 label=self._limit_label,
             ),
         )
+
+    def _connect_signals(self) -> None:
+        """Subscribe to manager signals to track cache usage and budgets."""
+        usage_signal = getattr(self._manager, "usageChanged", None)
+        limit_signal = getattr(self._manager, "cacheLimitChanged", None)
+        if usage_signal is None:
+            logger.error(
+                "%s missing usageChanged signal; cannot track cache usage",
+                type(self._manager).__name__,
+            )
+            raise RuntimeError("Manager missing usageChanged signal")
+        if limit_signal is None:
+            logger.error(
+                "%s missing cacheLimitChanged signal; cannot track budgets",
+                type(self._manager).__name__,
+            )
+            raise RuntimeError("Manager missing cacheLimitChanged signal")
+        try:
+            usage_signal.connect(self._notify)
+        except Exception:
+            logger.exception("Failed to connect usageChanged for %s", self._consumer_id)
+            raise
+        try:
+            limit_signal.connect(self._update_preferred_budget)
+        except Exception:
+            logger.exception(
+                "Failed to connect cacheLimitChanged for %s", self._consumer_id
+            )
+            raise
 
     def _get_usage(self) -> int:
         """Return the current cache usage in bytes."""
@@ -471,11 +484,6 @@ class TileCacheConsumer(_BudgetedCacheConsumer):
                 "Tile cache failed to trim below target | consumer=%s | usage=%d | "
                 "target=%d | attempts=%d"
             ),
-            hook_messages={
-                "add_tile": "Tile cache add hook failed",
-                "clear_caches": "Tile cache clear hook failed",
-            },
-            apply_config_message="Tile cache apply_config hook failed",
         )
 
 
@@ -513,13 +521,6 @@ class PyramidCacheConsumer(_BudgetedCacheConsumer):
                 "Pyramid cache failed to trim below target | consumer=%s | "
                 "usage=%d | target=%d | attempts=%d"
             ),
-            hook_messages={
-                "_drop_cache_entry": "Pyramid cache drop hook failed",
-                "clear": "Pyramid cache clear hook failed",
-                "_on_pyramid_generated": "Pyramid cache generated hook failed",
-                "remove_pyramid": "Pyramid cache remove hook failed",
-            },
-            apply_config_message="Pyramid cache apply_config hook failed",
         )
         self._manager.set_managed_mode(True)
 

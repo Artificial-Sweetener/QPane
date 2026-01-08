@@ -151,6 +151,8 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
 
     tileReady = Signal(TileIdentifier)
     tilesThrottled = Signal(TileIdentifier, int)
+    usageChanged = Signal(object)
+    cacheLimitChanged = Signal(object)
 
     def __init__(
         self,
@@ -171,12 +173,13 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._config = config
         self.tile_size = config.tile_size
         self.tile_overlap = config.tile_overlap
-        self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         self._cache_admission_guard = None
         self._managed_mode = False
         self._rejected_cache_keys: set[TileIdentifier] = set()
         self._tile_cache: TileCache = OrderedDict()
         self._cache_size_bytes: int = 0
+        self._cache_limit_bytes: int = 0
+        self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         self._executor: TaskExecutorProtocol | None = executor
         self._owns_executor = bool(owns_executor)
         # Unified worker state: identifier -> executor handle plus worker reference
@@ -197,6 +200,22 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
     def cache_usage_bytes(self) -> int:
         """Return the current tile cache usage in bytes."""
         return self._cache_size_bytes
+
+    @property
+    def cache_limit_bytes(self) -> int:
+        """Return the configured tile cache budget in bytes."""
+        return self._cache_limit_bytes
+
+    @cache_limit_bytes.setter
+    def cache_limit_bytes(self, value: int) -> None:
+        """Set the tile cache budget and emit change notifications."""
+        new_value = max(0, int(value))
+        previous = getattr(self, "_cache_limit_bytes", 0)
+        self._cache_limit_bytes = new_value
+        if new_value != previous:
+            self.cacheLimitChanged.emit(new_value)
+        if not self._managed_mode and self._cache_size_bytes > self._cache_limit_bytes:
+            self._schedule_cache_eviction()
 
     def set_managed_mode(self, enabled: bool) -> None:
         """Enable or disable managed mode.
@@ -244,19 +263,27 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         """Return tile identifiers currently queued for retry."""
         return list(self._tile_retry.pendingKeys())
 
+    def _set_cache_usage_bytes(self, value: int) -> None:
+        """Clamp and publish cache usage changes."""
+        clamped = max(0, int(value))
+        if clamped == self._cache_size_bytes:
+            return
+        self._cache_size_bytes = clamped
+        self.usageChanged.emit(clamped)
+
     def add_tile(self, tile: Tile) -> None:
         """Insert `tile` into the cache while updating bookkeeping."""
         identifier = tile.identifier
         if not self._allow_cache_insert(tile.size_bytes, identifier):
             return
+        new_size = self._cache_size_bytes
         previous = self._tile_cache.pop(identifier, None)
         if previous is not None:
-            self._cache_size_bytes = max(
-                0, self._cache_size_bytes - previous.size_bytes
-            )
+            new_size = max(0, new_size - previous.size_bytes)
         self._tile_cache[identifier] = tile
         self._tile_cache.move_to_end(identifier)
-        self._cache_size_bytes += tile.size_bytes
+        new_size += tile.size_bytes
+        self._set_cache_usage_bytes(new_size)
         if (
             not self._managed_mode
             and self.cache_limit_bytes > 0
@@ -347,7 +374,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         tile = self._tile_cache.pop(identifier, None)
         if tile is None:
             return
-        self._cache_size_bytes = max(0, self._cache_size_bytes - tile.size_bytes)
+        self._set_cache_usage_bytes(max(0, self._cache_size_bytes - tile.size_bytes))
 
     def clear_caches(self):
         """Removes all tiles from the cache and resets memory counters.
@@ -362,11 +389,11 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         cached_tiles = len(self._tile_cache)
         active_workers = len(self._worker_state)
         self._tile_cache.clear()
-        self._cache_size_bytes = 0
         self._worker_state.clear()
         self._rejected_cache_keys.clear()
         self._prefetch_drop_all()
         self._reset_cache_metrics()
+        self._set_cache_usage_bytes(0)
         if had_entries:
             self._record_eviction_metadata("clear")
         logger.info(
@@ -572,18 +599,20 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         """Evict a bounded batch of tiles on the main thread."""
         reason = self._consume_next_eviction_reason("limit")
         evicted = 0
+        new_usage = self._cache_size_bytes
         while (
-            self._cache_size_bytes > self.cache_limit_bytes
+            new_usage > self.cache_limit_bytes
             and self._tile_cache
             and evicted < _TILE_EVICTION_BATCH
         ):
             identifier, removed_tile = self._tile_cache.popitem(last=False)
-            self._cache_size_bytes -= removed_tile.size_bytes
+            new_usage -= removed_tile.size_bytes
             logger.info("Evicted tile from cache: %s", identifier)
             self._evictions_total += 1
             self._evicted_bytes += removed_tile.size_bytes
             self._record_eviction_metadata(reason)
             evicted += 1
+        self._set_cache_usage_bytes(new_usage)
         if (
             not self._managed_mode
             and self._cache_size_bytes > self.cache_limit_bytes

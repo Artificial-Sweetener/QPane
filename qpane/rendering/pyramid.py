@@ -171,6 +171,8 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
 
     pyramidReady = Signal(uuid.UUID)
     pyramidThrottled = Signal(uuid.UUID, int)
+    usageChanged = Signal(object)
+    cacheLimitChanged = Signal(object)
 
     def __init__(
         self,
@@ -191,13 +193,14 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._config = config
         self._executor: TaskExecutorProtocol | None = executor
         self._owns_executor = bool(owns_executor)
+        self._managed_mode = False
+        self._cache_limit_bytes: int = 0
         self._pyramids: Dict[uuid.UUID, ImagePyramid] = {}
         self._cache: OrderedDict[uuid.UUID, ImagePyramid] = OrderedDict()
-        self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         self._cache_admission_guard = None
-        self._managed_mode = False
         self._rejected_cache_keys: set[uuid.UUID] = set()
         self._cache_size_bytes: int = 0
+        self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         self._active_workers: Dict[uuid.UUID, PyramidGeneratorWorker] = {}
         self._active_handles: Dict[uuid.UUID, TaskHandle] = {}
         dispatcher = qt_retry_dispatcher(self._executor, category="pyramid_main")
@@ -215,6 +218,7 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
     def apply_config(self, config: Config) -> None:
         """Refresh derived values after a configuration update."""
         self._config = config
+        self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         if not self._managed_mode:
             self._enforce_cache_size()
 
@@ -222,6 +226,22 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
     def cache_usage_bytes(self) -> int:
         """Return the current pyramid cache usage in bytes."""
         return self._cache_size_bytes
+
+    @property
+    def cache_limit_bytes(self) -> int:
+        """Return the configured pyramid cache budget in bytes."""
+        return self._cache_limit_bytes
+
+    @cache_limit_bytes.setter
+    def cache_limit_bytes(self, value: int) -> None:
+        """Set the pyramid cache budget and emit change notifications."""
+        new_value = max(0, int(value))
+        previous = getattr(self, "_cache_limit_bytes", 0)
+        self._cache_limit_bytes = new_value
+        if new_value != previous:
+            self.cacheLimitChanged.emit(new_value)
+        if not self._managed_mode and self._cache_size_bytes > self._cache_limit_bytes:
+            self._enforce_cache_size()
 
     def set_managed_mode(self, enabled: bool) -> None:
         """Enable or disable managed mode.
@@ -421,7 +441,9 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             if pyramid.status == PyramidStatus.COMPLETE:
                 if self._allow_cache_insert(pyramid.size_bytes, image_id):
                     self._cache[image_id] = pyramid
-                    self._cache_size_bytes += pyramid.size_bytes
+                    self._set_cache_usage_bytes(
+                        self._cache_size_bytes + pyramid.size_bytes
+                    )
                     if not self._managed_mode:
                         self._enforce_cache_size()
                     logger.info("Pyramid generated for %s", image_id)
@@ -525,10 +547,10 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._pyramids.clear()
         had_entries = bool(self._cache)
         self._cache.clear()
-        self._cache_size_bytes = 0
         self._rejected_cache_keys.clear()
         self._prefetch_drop_all()
         self._reset_cache_metrics()
+        self._set_cache_usage_bytes(0)
         assert self._cache_size_bytes == 0, "Cache size not zero after clear"
         if had_entries:
             self._record_eviction_metadata("clear")
@@ -555,11 +577,21 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         """Return image IDs currently queued for retry."""
         return list(self._pyramid_retry.pendingKeys())
 
+    def _set_cache_usage_bytes(self, value: int) -> None:
+        """Clamp and publish cache usage changes."""
+        clamped = max(0, int(value))
+        if clamped == self._cache_size_bytes:
+            return
+        self._cache_size_bytes = clamped
+        self.usageChanged.emit(clamped)
+
     def _drop_cache_entry(self, image_id: uuid.UUID) -> None:
         """Remove a pyramid from the LRU cache and update size accounting."""
         self._assert_main_thread()
         if image_id in self._cache:
-            self._cache_size_bytes -= self._cache[image_id].size_bytes
+            self._set_cache_usage_bytes(
+                self._cache_size_bytes - self._cache[image_id].size_bytes
+            )
             del self._cache[image_id]
             assert self._cache_size_bytes >= 0, "Cache size went negative"
 
@@ -639,8 +671,9 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         evicted = 0
         evicted_paths = []
         bytes_freed = 0
+        new_usage = self._cache_size_bytes
         while (
-            self._cache_size_bytes > self.cache_limit_bytes
+            new_usage > self.cache_limit_bytes
             and self._cache
             and evicted < _PYRAMID_EVICTION_BATCH
         ):
@@ -655,10 +688,12 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             if removed_bytes:
                 bytes_freed += removed_bytes
                 self._evicted_bytes += removed_bytes
+                new_usage = max(0, new_usage - removed_bytes)
             evicted_paths.append(str(lru_id))
             self._evictions_total += 1
             self._record_eviction_metadata(reason)
             evicted += 1
+        self._set_cache_usage_bytes(new_usage)
         if evicted_paths:
             logger.info(
                 "Eviction batch: evicted=%d, paths=%s, bytes_freed=%d, "
