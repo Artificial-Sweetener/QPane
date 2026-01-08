@@ -33,6 +33,8 @@ The "Trinity" ensures the Public API is consistent across four pillars. **When o
 
 **Strict Constraint:** Demos must rely *exclusively* on the public API defined in `qpane.pyi`. Never reach into private internals (`_underscore_methods`) from example code.
 
+**Docs Guardrail:** Documentation is for host developers using the public facade. Describe only supported API and behaviors; never mention internal wiring or unsupported swaps (e.g., replacing managers).
+
 ## 4. Compatibility & Refactoring Strategy
 We distinguish strictly between the **Public API** and the **Internal Implementation**.
 
