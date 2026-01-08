@@ -70,14 +70,15 @@ def swap_progress_provider(qpane: "QPane") -> Iterable[DiagnosticRecord]:
 
 def _resolve_swap_metrics(qpane: "QPane") -> "SwapCoordinatorMetrics" | None:
     """Return the swap metrics snapshot from the delegate when present."""
-    delegate = getattr(qpane, "swapDelegate", None)
-    snapshot_fn = getattr(delegate, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
-        return None
     try:
-        metrics: SwapCoordinatorMetrics = snapshot_fn()
+        delegate = qpane.swapDelegate
     except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("swap_metrics", "Swap metrics snapshot failed", exc)
+        _log_snapshot_failure("swap_metrics", "Swap metrics delegate missing", exc)
+        return None
+    metrics = _safe_snapshot(
+        delegate, label="swap_metrics", message="Swap metrics snapshot failed"
+    )
+    if metrics is None:
         return None
     _clear_snapshot_failure("swap_metrics")
     return metrics
@@ -85,190 +86,156 @@ def _resolve_swap_metrics(qpane: "QPane") -> "SwapCoordinatorMetrics" | None:
 
 def _format_swap_summary(metrics: "SwapCoordinatorMetrics") -> str:
     """Format the swap summary row emphasising last navigation latency."""
-    last_nav = getattr(metrics, "last_navigation_ms", None)
-    if isinstance(last_nav, (int, float)) and last_nav >= 0:
-        return f"nav={last_nav:.0f}ms"
-    return "nav=-"
+    last_nav = metrics.last_navigation_ms
+    if last_nav is None or last_nav < 0:
+        return "nav=-"
+    return f"nav={last_nav:.0f}ms"
 
 
 def _format_prefetch_line(metrics: "SwapCoordinatorMetrics") -> str:
     """Format pending prefetch counters for the diagnostics overlay."""
-    pending_masks = getattr(metrics, "pending_mask_prefetch", None)
-    pending_predictors = getattr(metrics, "pending_predictors", None)
-    pending_pyramids = getattr(metrics, "pending_pyramid_prefetch", None)
-    pending_tiles = getattr(metrics, "pending_tile_prefetch", None)
     parts: list[str] = []
-    if isinstance(pending_masks, int) and pending_masks > 0:
-        parts.append(f"mask_prefetch={pending_masks}")
-    if isinstance(pending_predictors, int) and pending_predictors > 0:
-        parts.append(f"predictors={pending_predictors}")
-    if isinstance(pending_pyramids, int) and pending_pyramids > 0:
-        parts.append(f"pyramids={pending_pyramids}")
-    if isinstance(pending_tiles, int) and pending_tiles > 0:
-        parts.append(f"tiles={pending_tiles}")
+    if metrics.pending_mask_prefetch > 0:
+        parts.append(f"mask_prefetch={metrics.pending_mask_prefetch}")
+    if metrics.pending_predictors > 0:
+        parts.append(f"predictors={metrics.pending_predictors}")
+    if metrics.pending_pyramid_prefetch > 0:
+        parts.append(f"pyramids={metrics.pending_pyramid_prefetch}")
+    if metrics.pending_tile_prefetch > 0:
+        parts.append(f"tiles={metrics.pending_tile_prefetch}")
     return " | ".join(parts)
 
 
 def _format_renderer_metrics(qpane: "QPane") -> str:
     """Build the renderer metrics row for the diagnostics overlay."""
-    view = _view(qpane)
-    renderer = None if view is None else view.renderer
-    snapshot_fn = getattr(renderer, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
-        return ""
     try:
-        snapshot = snapshot_fn()
+        renderer = qpane.view().presenter.renderer
     except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("renderer", "Renderer metrics snapshot failed", exc)
+        _log_snapshot_failure("renderer", "Renderer unavailable for diagnostics", exc)
+        return ""
+    snapshot = _safe_snapshot(
+        renderer, label="renderer", message="Renderer metrics snapshot failed"
+    )
+    if snapshot is None:
         return ""
     _clear_snapshot_failure("renderer")
     parts: list[str] = []
-    allocations = getattr(snapshot, "base_buffer_allocations", None)
-    if isinstance(allocations, int) and allocations > 0:
-        parts.append(f"alloc={allocations}")
-    attempts = getattr(snapshot, "scroll_attempts", None)
-    hits = getattr(snapshot, "scroll_hits", None)
-    misses = getattr(snapshot, "scroll_misses", None)
-    if isinstance(attempts, int) and attempts >= 0:
-        if isinstance(hits, int) and hits >= 0:
-            parts.append(f"scroll={hits}/{attempts}")
-        else:
-            parts.append(f"scroll_attempts={attempts}")
-    if isinstance(misses, int) and misses:
-        parts.append(f"miss={misses}")
-    full = getattr(snapshot, "full_redraws", None)
-    partial = getattr(snapshot, "partial_redraws", None)
-    if isinstance(full, int) and isinstance(partial, int) and (full or partial):
-        parts.append(f"redraws={full}F/{partial}P")
-    paint_ms = getattr(snapshot, "last_paint_ms", None)
-    if isinstance(paint_ms, (int, float)) and paint_ms >= 0.0:
-        parts.append(f"paint={paint_ms:.0f}ms")
+    if snapshot.base_buffer_allocations > 0:
+        parts.append(f"alloc={snapshot.base_buffer_allocations}")
+    if snapshot.scroll_attempts >= 0:
+        parts.append(f"scroll={snapshot.scroll_hits}/{snapshot.scroll_attempts}")
+    if snapshot.scroll_misses > 0:
+        parts.append(f"miss={snapshot.scroll_misses}")
+    if snapshot.full_redraws or snapshot.partial_redraws:
+        parts.append(f"redraws={snapshot.full_redraws}F/{snapshot.partial_redraws}P")
+    if snapshot.last_paint_ms >= 0.0:
+        parts.append(f"paint={snapshot.last_paint_ms:.0f}ms")
     return " | ".join(parts)
 
 
 def _format_mask_metrics(qpane: "QPane") -> str:
     """Build the diagnostics row describing mask cache usage."""
-    controller = getattr(qpane, "mask_controller", None)
-    snapshot_fn = getattr(controller, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
+    controller = qpane.mask_controller
+    if controller is None:
         return ""
-    try:
-        snapshot = snapshot_fn()
-    except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("mask", "Mask metrics snapshot failed", exc)
+    snapshot = _safe_snapshot(
+        controller, label="mask", message="Mask metrics snapshot failed"
+    )
+    if snapshot is None:
         return ""
     _clear_snapshot_failure("mask")
-    usage_mb = _to_mb(getattr(snapshot, "cache_bytes", None))
-    hits = getattr(snapshot, "hits", None)
-    misses = getattr(snapshot, "misses", None)
-    colorize_ms = getattr(snapshot, "colorize_last_ms", None)
+    usage_mb = _to_mb(snapshot.cache_bytes)
     parts = [f"usage={usage_mb:.1f}MB"]
-    if isinstance(hits, int) and hits > 0:
-        parts.append(f"hit={hits}")
-    if isinstance(misses, int) and misses > 0:
-        parts.append(f"miss={misses}")
-    if isinstance(colorize_ms, (int, float)) and colorize_ms > 0:
-        parts.append(f"colorize={colorize_ms:.0f}ms")
+    if snapshot.hits > 0:
+        parts.append(f"hit={snapshot.hits}")
+    if snapshot.misses > 0:
+        parts.append(f"miss={snapshot.misses}")
+    if snapshot.colorize_last_ms is not None and snapshot.colorize_last_ms > 0:
+        parts.append(f"colorize={snapshot.colorize_last_ms:.0f}ms")
     return " | ".join(parts)
 
 
 def _format_tile_metrics(qpane: "QPane") -> str:
     """Summarize tile cache usage and retry counts for diagnostics."""
-    view = _view(qpane)
-    manager = None if view is None else view.tile_manager
-    snapshot_fn = getattr(manager, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
-        return ""
     try:
-        snapshot = snapshot_fn()
+        manager = qpane.view().tile_manager
     except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("tiles", "Tile metrics snapshot failed", exc)
+        _log_snapshot_failure("tiles", "Tile manager unavailable for diagnostics", exc)
+        return ""
+    snapshot = _safe_snapshot(
+        manager, label="tiles", message="Tile metrics snapshot failed"
+    )
+    if snapshot is None:
         return ""
     _clear_snapshot_failure("tiles")
-    usage_mb = _to_mb(getattr(snapshot, "cache_bytes", None))
-    limit_mb = _to_mb(getattr(snapshot, "cache_limit", None))
-    hits = getattr(snapshot, "hits", None)
-    misses = getattr(snapshot, "misses", None)
-    pending = getattr(snapshot, "pending_retries", None)
+    usage_mb = _to_mb(snapshot.cache_bytes)
+    limit_mb = _to_mb(snapshot.cache_limit)
     parts = [f"usage={usage_mb:.1f}/{limit_mb:.1f}MB"]
-    if isinstance(hits, int) and hits > 0:
-        parts.append(f"hit={hits}")
-    if isinstance(misses, int) and misses > 0:
-        parts.append(f"miss={misses}")
-    if isinstance(pending, int) and pending:
-        parts.append(f"retry={pending}")
+    if snapshot.hits > 0:
+        parts.append(f"hit={snapshot.hits}")
+    if snapshot.misses > 0:
+        parts.append(f"miss={snapshot.misses}")
+    if snapshot.pending_retries > 0:
+        parts.append(f"retry={snapshot.pending_retries}")
     return " | ".join(parts)
 
 
 def _format_pyramid_metrics(qpane: "QPane") -> str:
     """Summarize pyramid cache status for the diagnostics overlay."""
-    catalog = _catalog(qpane)
-    manager = getattr(catalog, "pyramid_manager", None)
-    snapshot_fn = getattr(manager, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
-        return ""
     try:
-        snapshot = snapshot_fn()
+        manager = qpane.catalog().pyramid_manager
     except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("pyramid", "Pyramid metrics snapshot failed", exc)
+        _log_snapshot_failure(
+            "pyramid", "Pyramid manager unavailable for diagnostics", exc
+        )
+        return ""
+    snapshot = _safe_snapshot(
+        manager, label="pyramid", message="Pyramid metrics snapshot failed"
+    )
+    if snapshot is None:
         return ""
     _clear_snapshot_failure("pyramid")
-    usage_mb = _to_mb(getattr(snapshot, "cache_bytes", None))
-    limit_mb = _to_mb(getattr(snapshot, "cache_limit", None))
-    active = getattr(snapshot, "active_jobs", None)
+    usage_mb = _to_mb(snapshot.cache_bytes)
+    limit_mb = _to_mb(snapshot.cache_limit)
     parts = [f"usage={usage_mb:.1f}/{limit_mb:.1f}MB"]
-    if isinstance(active, int) and active:
-        parts.append(f"active={active}")
+    if snapshot.active_jobs > 0:
+        parts.append(f"active={snapshot.active_jobs}")
     return " | ".join(parts)
 
 
 def _format_sam_metrics(qpane: "QPane") -> str:
     """Format cache stats for the SAM predictor workflow."""
-    accessor = getattr(qpane, "samManager", None)
-    manager = accessor() if callable(accessor) else None
-    snapshot_fn = getattr(manager, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
+    manager = qpane.samManager()
+    if manager is None:
         return ""
-    try:
-        snapshot = snapshot_fn()
-    except Exception as exc:  # pragma: no cover - defensive guard
-        _log_snapshot_failure("sam", "SAM metrics snapshot failed", exc)
+    snapshot = _safe_snapshot(
+        manager, label="sam", message="SAM metrics snapshot failed"
+    )
+    if snapshot is None:
         return ""
     _clear_snapshot_failure("sam")
-    usage_mb = _to_mb(getattr(snapshot, "cache_bytes", None))
-    count = getattr(snapshot, "cache_count", None)
-    pending = getattr(snapshot, "pending_retries", None)
+    usage_mb = _to_mb(snapshot.cache_bytes)
     parts = [f"usage={usage_mb:.1f}MB"]
-    if isinstance(count, int):
-        parts.append(f"cached={count}")
-    if isinstance(pending, int) and pending:
-        parts.append(f"retry={pending}")
+    parts.append(f"cached={snapshot.cache_count}")
+    if snapshot.pending_retries > 0:
+        parts.append(f"retry={snapshot.pending_retries}")
     return " | ".join(parts)
 
 
 _MB = 1024 * 1024
 
 
-def _to_mb(value) -> float:
+def _to_mb(value: int | float) -> float:
     """Convert byte counts to megabytes for diagnostics display."""
-    if isinstance(value, (int, float)):
-        return float(value) / _MB
-    return 0.0
+    return float(value) / _MB if value else 0.0
 
 
-def _view(qpane: "QPane"):
-    """Return the QPane view collaborator or ``None`` when unavailable."""
+def _safe_snapshot(provider, *, label: str, message: str):
+    """Call snapshot_metrics on ``provider`` and guard against failures."""
     try:
-        return qpane.view()
-    except AttributeError:
-        return None
-
-
-def _catalog(qpane: "QPane"):
-    """Return the QPane catalog collaborator or ``None`` when unavailable."""
-    try:
-        return qpane.catalog()
-    except AttributeError:
+        return provider.snapshot_metrics()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        _log_snapshot_failure(label, message, exc)
         return None
 
 

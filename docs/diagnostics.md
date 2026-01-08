@@ -28,6 +28,8 @@ When enabled, the overlay always shows a few "base" rows at the top:
 *   **Swap:** Latency of the last navigation event.
 *   **Pyramid Level:** Which resolution tier is currently active.
 
+> Rows only appear for features that are installed. For example, SAM rows stay hidden until a SAM manager is attached; mask rows hide when masking is disabled. The overlay surfaces whatever data is available without requiring host-side wiring.
+
 Below these, you can enable specific **Domains** to drill down into subsystems.
 
 ## Drill Down (Domains)

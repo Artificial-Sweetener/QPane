@@ -60,6 +60,8 @@ class MaskOverlayMetrics:
     evicted_bytes: int
     last_eviction_reason: str | None
     last_eviction_timestamp: float | None
+    cache_limit: int = 0
+    pending_retries: int = 0
     prefetch_requested: int = 0
     prefetch_completed: int = 0
     prefetch_failed: int = 0

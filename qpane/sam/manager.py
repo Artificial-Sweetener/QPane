@@ -69,6 +69,15 @@ class SamPredictorMetrics:
     pending_retries: int
     hits: int
     misses: int
+    cache_limit: int = 0
+    evictions: int = 0
+    evicted_bytes: int = 0
+    last_eviction_reason: str | None = None
+    last_eviction_timestamp: float | None = None
+    prefetch_requested: int = 0
+    prefetch_completed: int = 0
+    prefetch_failed: int = 0
+    last_prefetch_ms: float | None = None
 
 
 class SamWorkerSignals(QObject):
@@ -261,6 +270,15 @@ class SamManager(QObject):
             pending_retries=len(self._predictor_retry_entries),
             hits=self._cache_hits,
             misses=self._cache_misses,
+            cache_limit=0,
+            evictions=0,
+            evicted_bytes=0,
+            last_eviction_reason=None,
+            last_eviction_timestamp=None,
+            prefetch_requested=0,
+            prefetch_completed=0,
+            prefetch_failed=0,
+            last_prefetch_ms=None,
         )
 
     def activePredictorLoads(self) -> int:

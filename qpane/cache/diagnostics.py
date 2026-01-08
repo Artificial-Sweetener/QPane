@@ -152,7 +152,7 @@ def _safe_snapshot(coordinator, *, caller: str) -> dict[str, object] | None:
 def _resolve_coordinator(qpane: "QPane"):
     """Return the cache coordinator while logging missing state once."""
     global _MISSING_COORDINATOR_LOGGED
-    coordinator = getattr(qpane, "cacheCoordinator", None)
+    coordinator = qpane.cacheCoordinator
     if coordinator is None:
         if not _MISSING_COORDINATOR_LOGGED:
             logger.warning("Cache diagnostics unavailable; cache coordinator missing")
@@ -211,10 +211,9 @@ def _bundle_metrics(qpane: "QPane", consumer_id: str) -> _CacheMetricsBundle:
     elif consumer_id == "pyramids":
         manager = _catalog_pyramid_manager(qpane)
     elif consumer_id == "mask_overlays":
-        manager = getattr(qpane, "mask_controller", None)
+        manager = qpane.mask_controller
     elif consumer_id == "predictors":
-        accessor = getattr(qpane, "samManager", None)
-        manager = accessor() if callable(accessor) else None
+        manager = qpane.samManager()
     else:  # pragma: no cover - defensive guard
         manager = None
     if manager is None:
@@ -225,49 +224,81 @@ def _bundle_metrics(qpane: "QPane", consumer_id: str) -> _CacheMetricsBundle:
             )
             _MISSING_DETAIL_MANAGER_LOGS.add(consumer_id)
         return _CacheMetricsBundle()
-    snapshot_fn = getattr(manager, "snapshot_metrics", None)
-    if not callable(snapshot_fn):
-        if consumer_id not in _MISSING_DETAIL_SNAPSHOT_LOGS:
-            logger.warning(
-                "Cache diagnostics missing snapshot_metrics for consumer %s",
-                consumer_id,
-            )
-            _MISSING_DETAIL_SNAPSHOT_LOGS.add(consumer_id)
-        return _CacheMetricsBundle()
     try:
-        snapshot = snapshot_fn()
+        snapshot = manager.snapshot_metrics()
     except Exception:  # pragma: no cover - defensive guard
         logger.exception(
             "Cache diagnostics failed to snapshot metrics for consumer %s",
             consumer_id,
         )
         return _CacheMetricsBundle()
-    return _CacheMetricsBundle(
-        cache_bytes=getattr(snapshot, "cache_bytes", None),
-        cache_limit=getattr(snapshot, "cache_limit", None),
-        hits=getattr(snapshot, "hits", None),
-        misses=getattr(snapshot, "misses", None),
-        evictions=getattr(snapshot, "evictions", None),
-        evicted_bytes=getattr(snapshot, "evicted_bytes", None),
-        pending_retries=getattr(snapshot, "pending_retries", None),
-        last_eviction_reason=getattr(snapshot, "last_eviction_reason", None),
-        last_eviction_timestamp=getattr(
-            snapshot,
-            "last_eviction_timestamp",
-            None,
-        ),
-        prefetch_requested=getattr(snapshot, "prefetch_requested", None),
-        prefetch_completed=getattr(snapshot, "prefetch_completed", None),
-        prefetch_failed=getattr(snapshot, "prefetch_failed", None),
-        last_prefetch_ms=getattr(snapshot, "last_prefetch_ms", None),
-        colorize_last_ms=getattr(snapshot, "colorize_last_ms", None),
-        colorize_avg_ms=getattr(snapshot, "colorize_avg_ms", None),
-        colorize_max_ms=getattr(snapshot, "colorize_max_ms", None),
-        colorize_samples=getattr(snapshot, "colorize_samples", None),
-        colorize_slow_count=getattr(snapshot, "colorize_slow_count", None),
-        colorize_threshold_ms=getattr(snapshot, "colorize_threshold_ms", None),
-        colorize_last_source=getattr(snapshot, "colorize_last_source", None),
-    )
+    return _coerce_metrics(snapshot)
+
+
+def _coerce_metrics(snapshot: object) -> _CacheMetricsBundle:
+    """Convert snapshot objects into a unified cache metrics bundle."""
+    try:
+        from ..rendering.cache_metrics import CacheManagerMetrics
+        from ..masks.mask_controller import MaskOverlayMetrics
+        from ..sam.manager import SamPredictorMetrics
+    except Exception:
+        CacheManagerMetrics = MaskOverlayMetrics = SamPredictorMetrics = ()  # type: ignore[assignment]
+    if isinstance(snapshot, CacheManagerMetrics):
+        return _CacheMetricsBundle(
+            cache_bytes=snapshot.cache_bytes,
+            cache_limit=snapshot.cache_limit,
+            hits=snapshot.hits,
+            misses=snapshot.misses,
+            evictions=snapshot.evictions,
+            evicted_bytes=snapshot.evicted_bytes,
+            pending_retries=snapshot.pending_retries,
+            last_eviction_reason=snapshot.last_eviction_reason,
+            last_eviction_timestamp=snapshot.last_eviction_timestamp,
+            prefetch_requested=snapshot.prefetch_requested,
+            prefetch_completed=snapshot.prefetch_completed,
+            prefetch_failed=snapshot.prefetch_failed,
+            last_prefetch_ms=snapshot.last_prefetch_ms,
+        )
+    if isinstance(snapshot, MaskOverlayMetrics):
+        return _CacheMetricsBundle(
+            cache_bytes=snapshot.cache_bytes,
+            cache_limit=snapshot.cache_limit,
+            hits=snapshot.hits,
+            misses=snapshot.misses,
+            evictions=snapshot.evictions,
+            evicted_bytes=snapshot.evicted_bytes,
+            pending_retries=snapshot.pending_retries,
+            last_eviction_reason=snapshot.last_eviction_reason,
+            last_eviction_timestamp=snapshot.last_eviction_timestamp,
+            prefetch_requested=snapshot.prefetch_requested,
+            prefetch_completed=snapshot.prefetch_completed,
+            prefetch_failed=snapshot.prefetch_failed,
+            last_prefetch_ms=snapshot.last_prefetch_ms,
+            colorize_last_ms=snapshot.colorize_last_ms,
+            colorize_avg_ms=snapshot.colorize_avg_ms,
+            colorize_max_ms=snapshot.colorize_max_ms,
+            colorize_samples=snapshot.colorize_samples,
+            colorize_slow_count=snapshot.colorize_slow_count,
+            colorize_threshold_ms=snapshot.colorize_threshold_ms,
+            colorize_last_source=snapshot.colorize_last_source,
+        )
+    if isinstance(snapshot, SamPredictorMetrics):
+        return _CacheMetricsBundle(
+            cache_bytes=snapshot.cache_bytes,
+            cache_limit=snapshot.cache_limit,
+            hits=snapshot.hits,
+            misses=snapshot.misses,
+            evictions=snapshot.evictions,
+            evicted_bytes=snapshot.evicted_bytes,
+            pending_retries=snapshot.pending_retries,
+            last_eviction_reason=snapshot.last_eviction_reason,
+            last_eviction_timestamp=snapshot.last_eviction_timestamp,
+            prefetch_requested=snapshot.prefetch_requested,
+            prefetch_completed=snapshot.prefetch_completed,
+            prefetch_failed=snapshot.prefetch_failed,
+            last_prefetch_ms=snapshot.last_prefetch_ms,
+        )
+    return _CacheMetricsBundle()
 
 
 def _format_counters(bundle: _CacheMetricsBundle) -> str:
@@ -319,7 +350,10 @@ def _stack_tile_manager(qpane: "QPane"):
             )
             _MISSING_TILE_VIEW_LOGGED = True
         return None
-    manager = getattr(view, "tile_manager", None)
+    try:
+        manager = view.tile_manager
+    except AttributeError:
+        manager = None
     if manager is None and not _MISSING_TILE_MANAGER_LOGGED:
         logger.warning("View lacks tile_manager attribute for cache diagnostics")
         _MISSING_TILE_MANAGER_LOGGED = True
@@ -338,16 +372,15 @@ def _catalog_pyramid_manager(qpane: "QPane"):
             )
             _MISSING_CATALOG_LOGGED = True
         return None
-    pyramid_accessor = getattr(catalog_facade, "pyramidManager", None)
-    if not callable(pyramid_accessor):
+    try:
+        return catalog_facade.pyramidManager()
+    except AttributeError:
         if not _MISSING_PYRAMID_ACCESSOR_LOGGED:
             logger.warning(
                 "Catalog facade lacks pyramidManager accessor for cache diagnostics"
             )
             _MISSING_PYRAMID_ACCESSOR_LOGGED = True
         return None
-    try:
-        return pyramid_accessor()
     except Exception:  # pragma: no cover - defensive guard
         logger.exception("Catalog.pyramidManager failed during cache diagnostics")
         return None
