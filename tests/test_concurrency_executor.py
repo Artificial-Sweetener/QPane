@@ -115,6 +115,26 @@ class TestQThreadPoolExecutor:
         assert executor.cancel(pending_handle) is False
         executor.shutdown()
 
+    def test_drops_tasks_when_pool_deleted(self, qapp, caplog) -> None:
+        """Workers should be dropped quietly when the pool has been deleted."""
+        pool = QThreadPool(qapp)
+        executor = QThreadPoolExecutor(pool=pool, name="dead-pool")
+        pool.deleteLater()
+        qapp.processEvents()
+        executor._pool_unavailable = True
+        executor._pool_unavailable_logged = False
+        worker = _CompletionWorker()
+        with caplog.at_level("WARNING"):
+            handle = executor.submit(worker, category="tiles")
+        snapshot = executor.snapshot()
+        assert snapshot.active_total == 0
+        assert snapshot.pending_total == 0
+        assert executor.cancel(handle) is False
+        assert any(
+            "thread pool is unavailable" in record.message for record in caplog.records
+        )
+        executor.shutdown()
+
     def test_dispatch_to_main_thread_marks_completion(self, qapp) -> None:
         """Main-thread callbacks should run and report completion."""
         pool = QThreadPool()

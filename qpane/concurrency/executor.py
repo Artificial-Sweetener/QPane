@@ -35,6 +35,7 @@ from PySide6.QtCore import (
     QThreadPool,
     Signal,
 )
+from shiboken6 import isValid
 
 from .thread_policy import ThreadPolicy, build_thread_policy, update_thread_policy
 
@@ -236,6 +237,8 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
         """
         self._policy = policy or build_thread_policy()
         self._pool = pool or QThreadPool()
+        self._pool_unavailable = False
+        self._pool_unavailable_logged = False
         self._apply_pool_max_threads_locked(self._policy.max_workers)
         self._name = name or self._describe_pool(self._pool)
         self._lock = threading.RLock()
@@ -577,10 +580,12 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
                         )
             # active tasks continue running; caller controls cancellation
         if wait and hasattr(self._pool, "waitForDone"):
-            try:
-                self._pool.waitForDone()
-            except Exception:  # pragma: no cover - defensive guard
-                logger.debug("waitForDone failed for %s", self._pool, exc_info=True)
+            if self._is_pool_available():
+                try:
+                    self._pool.waitForDone()
+                except Exception:  # pragma: no cover - defensive guard
+                    logger.debug("waitForDone failed for %s", self._pool, exc_info=True)
+        self._pool_unavailable = True
 
     def _is_gui_thread(self) -> bool:
         """Return ``True`` when running on the Qt GUI thread."""
@@ -706,6 +711,8 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
 
     def _guard_pool_max_threads_locked(self) -> int | None:
         """Return the pool thread cap and reapply policy when it drifts."""
+        if not self._is_pool_available():
+            return None
         if not hasattr(self._pool, "maxThreadCount"):
             return None
         try:
@@ -743,6 +750,32 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
             self._dirty_callback(domain)
         except Exception:
             logger.debug("Executor dirty callback failed", exc_info=True)
+
+    def _is_pool_available(self) -> bool:
+        """Return True when the underlying pool is still valid."""
+        if getattr(self, "_pool_unavailable", False):
+            return False
+        pool = self._pool
+        if pool is None:
+            self._pool_unavailable = True
+            return False
+        try:
+            alive = isValid(pool)
+        except Exception:
+            alive = False
+        if not alive:
+            self._pool_unavailable = True
+        return alive
+
+    def _log_pool_unavailable_once(self) -> None:
+        """Warn once when the pool is unavailable and tasks are dropped."""
+        if self._pool_unavailable_logged:
+            return
+        logger.warning(
+            "Executor %s thread pool is unavailable; dropping queued work",
+            self._name,
+        )
+        self._pool_unavailable_logged = True
 
     def _swap_policy(
         self, policy: ThreadPolicy, *, update_pool_threads: bool = False
@@ -892,6 +925,10 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
             return
         # Recompute priority at activation time using the current policy.
         priority = self._policy.priority_for(category)
+        if not self._is_pool_available():
+            self._log_pool_unavailable_once()
+            self._cleanup_activation_failure_locked(entry)
+            return
         try:
             self._pool.start(runnable, priority)
         except TypeError:
@@ -991,6 +1028,8 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
 
     def _apply_pool_max_threads_locked(self, max_workers: int | None = None) -> None:
         """Apply the configured worker cap to the underlying pool."""
+        if not self._is_pool_available():
+            return
         target = self._policy.max_workers if max_workers is None else max_workers
         if hasattr(self._pool, "setMaxThreadCount"):
             try:
