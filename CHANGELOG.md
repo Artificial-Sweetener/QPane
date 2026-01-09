@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 (2026-01-09)
+
+### Features
+- Simplify tool dispatch by removing reflective fallbacks and documenting default tool modes
+
+### Fixes
+- Prevent SAM feature install races in the test harness by enforcing deterministic setup
+
+### Refactors
+- Emit cache coordination signals for more reliable budget and usage diagnostics
+- Tighten swap delegate conformance to the strict protocol implementation
+- Enforce typed diagnostics snapshots for safer consumer handling
+
+### Documentation
+- Add PySide6 version badge to the README
+- Clarify agent guardrails for host-facing scope
+
 ## v1.1.1 (2026-01-04)
 
 ### Fixes
