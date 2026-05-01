@@ -31,6 +31,7 @@ from .hooks import (
     CursorProvider,
     OverlayDrawFn,
     QPaneHooks,
+    SceneOverlayDrawFn,
     ToolFactory,
     ToolSignalBinder,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "FeatureCoordinator",
     "CursorProvider",
     "OverlayDrawFn",
+    "SceneOverlayDrawFn",
     "QPaneHooks",
     "ToolFactory",
     "ToolSignalBinder",

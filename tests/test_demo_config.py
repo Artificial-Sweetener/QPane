@@ -17,8 +17,7 @@
 """Example configuration dialog integration and persistence tests."""
 
 import pytest
-from PySide6.QtCore import QPointF
-from PySide6.QtGui import QImage, QTransform
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QCheckBox
 
 from examples.demo import ExampleOptions, ExampleWindow, parse_args
@@ -29,7 +28,7 @@ from examples.demonstration.config.spec import (
     field_sets_for_sections,
 )
 from qpane import Config, QPane
-from qpane.rendering import RenderState, RenderStrategy
+from tests.helpers.render_plan import make_render_plan
 
 MB = 1024 * 1024
 
@@ -222,25 +221,17 @@ def test_diagnostics_include_pyramid_level(qapp):
         base_image.fill(0)
         qpane_widget.original_image = base_image
         view = qpane_widget.view()
-        render_state = RenderState(
+        render_plan = make_render_plan(
+            qpane_widget.rect(),
             source_image=QImage(512, 512, QImage.Format_ARGB32),
             pyramid_scale=0.25,
-            transform=QTransform(),
-            zoom=1.0,
-            strategy=RenderStrategy.DIRECT,
-            render_hint_enabled=False,
-            debug_draw_tile_grid=False,
-            tiles_to_draw=[],
             tile_size=view.tile_manager.tile_size,
             tile_overlap=view.tile_manager.tile_overlap,
             max_tile_cols=0,
             max_tile_rows=0,
-            qpane_rect=qpane_widget.rect(),
-            current_pan=QPointF(),
             physical_viewport_rect=qpane_widget.physicalViewportRect(),
-            visible_tile_range=None,
         )
-        view.renderer._current_render_state = render_state
+        view.renderer._current_render_plan = render_plan
         snapshot = qpane_widget.gatherDiagnostics()
         assert any(
             record.label == "Pyramid Level"

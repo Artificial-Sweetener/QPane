@@ -78,12 +78,16 @@ class _PanelStub:
         screen,
     ) -> None:
         self._catalog = catalog
-        self.original_image = image
+        self._image = image
         self._screen = screen
 
     @property
     def currentImagePath(self) -> Path | None:
         return self._catalog.currentImagePath()
+
+    @property
+    def currentImage(self) -> QImage:
+        return self._image
 
     def screen(self):
         return self._screen
@@ -179,13 +183,13 @@ def test_is_drag_out_allowed_blocks_when_scaled_larger() -> None:
     image.fill(0xFFFFFFFF)
     viewport_box = _FakeGeometry(50, 50)
     assert not is_drag_out_allowed(
-        image=image,
+        image_size=image.size(),
         zoom=1.0,
         zoom_mode=ViewportZoomMode.FIT,
         viewport_size=viewport_box.size(),
     )
     assert not is_drag_out_allowed(
-        image=image,
+        image_size=image.size(),
         zoom=2.0,
         zoom_mode=ViewportZoomMode.CUSTOM,
         viewport_size=viewport_box.size(),

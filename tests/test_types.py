@@ -21,6 +21,7 @@ from dataclasses import FrozenInstanceError
 import uuid
 
 import pytest
+from PySide6.QtCore import QRectF
 from PySide6.QtGui import QImage
 
 from qpane import (
@@ -30,6 +31,13 @@ from qpane import (
     DiagnosticsDomain,
     LinkedGroup,
     PlaceholderScaleMode,
+    QPaneCatalogImageLayerRequest,
+    QPaneScene,
+    QPaneSceneLayer,
+    QPaneSceneRequest,
+    QPaneSceneTemplate,
+    QPaneSceneTemplateBindings,
+    QPaneTemplateLayer,
     ZoomMode,
 )
 from qpane.types import DiagnosticRecord, __all__ as exported_types
@@ -47,6 +55,17 @@ def test_type_exports_are_listed() -> None:
         "DiagnosticRecord",
         "MaskInfo",
         "MaskSavedPayload",
+        "QPaneScene",
+        "QPaneSceneLayer",
+        "QPaneSceneRequest",
+        "QPaneCatalogImageLayerRequest",
+        "QPaneSceneTemplate",
+        "QPaneTemplateLayer",
+        "QPaneSceneTemplateBindings",
+        "QPaneSceneClip",
+        "QPaneSceneHit",
+        "QPaneSceneOverlayState",
+        "QPaneSceneOverlayLayer",
     }
     assert expected.issubset(set(exported_types))
 
@@ -103,3 +122,68 @@ def test_diagnostic_record_formatting() -> None:
     assert str(record) == "Label: Value"
     standalone = DiagnosticRecord("", "Solo")
     assert standalone.formatted() == "Solo"
+
+
+def test_scene_layer_copies_metadata_and_geometry() -> None:
+    """Public scene types should preserve snapshots instead of caller-owned objects."""
+    image_id = uuid.uuid4()
+    layer_id = uuid.uuid4()
+    placement = QRectF(0, 0, 10, 10)
+    metadata = {"record": {"id": 1}}
+
+    layer = QPaneSceneLayer(
+        layer_id=layer_id,
+        image_id=image_id,
+        placement=placement,
+        metadata=metadata,
+    )
+    scene = QPaneScene(
+        composition_id=uuid.uuid4(),
+        scene_id=uuid.uuid4(),
+        title="Scene",
+        bounds=QRectF(0, 0, 10, 10),
+        layers=(layer,),
+    )
+    request = QPaneSceneRequest(
+        composition_id=None,
+        title=None,
+        bounds=QRectF(0, 0, 10, 10),
+        layers=(
+            QPaneCatalogImageLayerRequest(
+                layer_id=layer_id,
+                image_id=image_id,
+                placement=placement,
+                metadata=metadata,
+            ),
+        ),
+    )
+    template = QPaneSceneTemplate(
+        template_id=uuid.uuid4(),
+        bounds=QRectF(0, 0, 10, 10),
+        layers=(
+            QPaneTemplateLayer(
+                layer_id=uuid.uuid4(),
+                source_slot="image",
+                placement=placement,
+                metadata=metadata,
+            ),
+        ),
+    )
+    bindings = QPaneSceneTemplateBindings(
+        composition_id=None,
+        catalog_images={"image": image_id},
+        metadata={"image": metadata},
+    )
+    placement.setWidth(50)
+    metadata["other"] = True
+
+    assert layer.placement.width() == 10
+    assert "other" not in layer.metadata
+    assert scene.layers == (layer,)
+    assert request.layers[0].placement.width() == 10
+    assert "other" not in request.layers[0].metadata
+    assert template.layers[0].placement.width() == 10
+    assert "other" not in template.layers[0].metadata
+    assert "other" not in bindings.metadata["image"]
+    with pytest.raises(TypeError):
+        layer.metadata["other"] = False  # type: ignore[index]

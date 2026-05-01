@@ -14,10 +14,10 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize
-from PySide6.QtGui import QImage, QTransform
+from PySide6.QtCore import QRect, QSize
+from PySide6.QtGui import QImage
 from qpane import QPane
-from qpane.rendering import RenderState, RenderStrategy
+from tests.helpers.render_plan import make_render_plan
 
 
 def _cleanup_qpane(qpane, qapp):
@@ -33,35 +33,21 @@ def test_renderer_paint_duration_updates(qapp):
         renderer.allocate_buffers(QSize(16, 16), 1.0)
         calls = []
 
-        def fake_redraw(region, state):
-            calls.append((region, state))
+        def fake_redraw(region, plan):
+            calls.append((region, plan))
 
         renderer._redraw_base_image_buffer = fake_redraw  # type: ignore[attr-defined]
         renderer.markDirty()
         source_image = QImage(16, 16, QImage.Format_ARGB32)
         source_image.fill(0)
-        state = RenderState(
+        plan = make_render_plan(
+            QRect(0, 0, 16, 16),
             source_image=source_image,
-            pyramid_scale=1.0,
-            transform=QTransform(),
-            zoom=1.0,
-            strategy=RenderStrategy.DIRECT,
-            render_hint_enabled=False,
-            debug_draw_tile_grid=False,
-            tiles_to_draw=[],
-            tile_size=64,
-            tile_overlap=0,
-            max_tile_cols=1,
-            max_tile_rows=1,
-            qpane_rect=QRect(0, 0, 16, 16),
-            current_pan=QPointF(0.0, 0.0),
-            physical_viewport_rect=QRectF(0.0, 0.0, 16.0, 16.0),
-            visible_tile_range=None,
         )
-        renderer.paint(state)
+        renderer.paint(plan)
         first_duration = renderer.get_last_paint_duration_ms()
         assert first_duration >= 0.0
-        renderer.paint(state)
+        renderer.paint(plan)
         second_duration = renderer.get_last_paint_duration_ms()
         assert second_duration >= 0.0
         assert calls, "renderer should invoke buffer redraw when dirty"

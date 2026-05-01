@@ -113,7 +113,7 @@ class CacheRegistry:
         *,
         consumer_id: str = "mask_overlays",
     ):
-        """Attach ``controller`` as the mask overlay cache consumer if possible.
+        """Attach ``controller`` as the mask render cache consumer if possible.
 
         Args:
             controller: Mask controller that exposes overlay cache hooks.

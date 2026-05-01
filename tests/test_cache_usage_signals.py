@@ -27,7 +27,8 @@ from qpane.cache.coordinator import CacheCoordinator
 from qpane.cache.consumers import TileCacheConsumer
 from qpane.core import Config
 from qpane.rendering.pyramid import PyramidManager
-from qpane.rendering.tiles import Tile, TileIdentifier, TileManager
+from qpane.rendering.tiles import Tile, TileManager
+from tests.helpers.render_plan import make_tile_key
 from tests.helpers.executor_stubs import StubExecutor
 
 
@@ -38,8 +39,8 @@ def small_image() -> QImage:
 
 
 def _make_tile(image: QImage) -> Tile:
-    identifier = TileIdentifier(uuid.uuid4(), None, 1.0, 0, 0)
-    return Tile(identifier=identifier, image=image)
+    key = make_tile_key(uuid.uuid4(), None, 1.0, 0, 0)
+    return Tile(key=key, image=image)
 
 
 def test_tile_manager_emits_usage_changed(qapp, small_image: QImage) -> None:

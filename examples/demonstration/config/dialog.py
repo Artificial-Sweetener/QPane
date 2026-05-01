@@ -14,11 +14,7 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Config dialog used by the example to edit QPane settings with feature-gated controls.
-
-The dialog mirrors the ``Config`` tree, showing how to add controls per domain and apply
-changes back through ``QPane.applySettings`` without touching private state.
-"""
+"""Config dialog used by the example to edit QPane settings."""
 
 from __future__ import annotations
 import json
@@ -355,16 +351,12 @@ class FilterStatusLabel(QLabel):
 
 
 class ConfigDialog(QDialog):
-    """Dialog that edits QPane configuration settings for the demo with feature-gated controls.
+    """Dialog that edits QPane configuration settings for the demo.
 
     Args:
         config: Starting Config snapshot to edit.
         parent: Optional parent widget.
         active_features: Installed feature names used to hide gated controls.
-    Extension seams:
-    - Add new FieldSpecs in ``examples.demonstration.config.spec`` grouped by domain.
-    - Wire new editors in this dialog and apply through ``QPane.applySettings`` (no private state).
-    - Use ``feature_namespace`` to hide fields when features are inactive.
     """
 
     ALL_FIELDS: set[str] = _ALL_FIELDS

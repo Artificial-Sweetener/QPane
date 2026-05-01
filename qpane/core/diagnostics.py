@@ -23,15 +23,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtGui import QImage
-
 from ..types import DiagnosticRecord
 
 if TYPE_CHECKING:  # pragma: no cover - only needed for static analysis
     from ..qpane import QPane
-    from ..rendering import RenderState
+    from ..scene.render_plan import RasterLayerRenderItem, SceneRenderPlan
 else:  # pragma: no cover - fallback for runtime to avoid cycles
-    RenderState = Any
+    RasterLayerRenderItem = Any
+    SceneRenderPlan = Any
 logger = logging.getLogger(__name__)
 
 
@@ -144,7 +143,6 @@ def build_core_diagnostics(
     viewport: Any = None,
     tile_manager: Any = None,
     pyramid_manager: Any = None,
-    base_image: QImage | None = None,
     cache_snapshot: dict[str, object] | None = None,
 ) -> tuple[DiagnosticRecord, ...]:
     """Build diagnostics rows for available render and cache collaborators.
@@ -154,7 +152,6 @@ def build_core_diagnostics(
         viewport: Viewport used to infer zoom percentage.
         tile_manager: Source for tile cache usage and limits. (unused)
         pyramid_manager: Source for pyramid cache usage and limits. (unused)
-        base_image: Original image used when describing pyramid resolution.
         cache_snapshot: Optional cache coordinator snapshot used to display the
             aggregate cache budget and usage without recomputing it in the
             provider.
@@ -164,7 +161,7 @@ def build_core_diagnostics(
         were supplied.
     """
     records: list[DiagnosticRecord] = []
-    render_state: RenderState | None = None
+    render_plan: SceneRenderPlan | None = None
     if renderer is not None:
         last_ms, average_ms, max_ms = renderer.paint_stats()
         paint_parts = [f"{last_ms:.1f} ms"]
@@ -173,7 +170,7 @@ def build_core_diagnostics(
         if max_ms > 0.0:
             paint_parts.append(f"max={max_ms:.1f}")
         records.append(DiagnosticRecord("Paint", " ".join(paint_parts)))
-        render_state = renderer.get_current_render_state()
+        render_plan = renderer.get_current_render_plan()
     if cache_snapshot is not None:
         aggregate = _aggregate_cache_record(cache_snapshot)
         if aggregate is not None:
@@ -191,27 +188,30 @@ def build_core_diagnostics(
             records.append(DiagnosticRecord("Smooth Zoom FPS", fps_label))
             frame_label = f"{smooth_zoom.frame_ms:.1f}ms ({smooth_zoom.mode})"
             records.append(DiagnosticRecord("Smooth Zoom Frame", frame_label))
-    if render_state is not None:
-        pyramid_record = pyramid_level_record(render_state, base_image)
+    if render_plan is not None:
+        pyramid_record = pyramid_level_record(render_plan)
         if pyramid_record is not None:
             records.append(pyramid_record)
     return tuple(records)
 
 
 def pyramid_level_record(
-    state: RenderState, base_image: QImage | None
+    plan_or_item: SceneRenderPlan | RasterLayerRenderItem,
 ) -> DiagnosticRecord | None:
-    """Describe the rendered pyramid level when state and source images are valid."""
-    source_image = state.source_image
+    """Describe the rendered pyramid level when plan and source images are valid."""
+    item = _base_raster_item(plan_or_item)
+    if item is None:
+        return None
+    source_image = item.source_image
     if source_image.isNull():
         return None
     source_width = source_image.width()
     if source_width <= 0:
         return None
     base_width = 0
-    if base_image is not None and not base_image.isNull():
-        base_width = base_image.width()
-    scale = state.pyramid_scale
+    if _is_scene_render_plan(plan_or_item):
+        base_width = plan_or_item.content_snapshot.base_image_size.width()
+    scale = item.pyramid_scale
     has_scale = scale > 0
     is_native = has_scale and abs(scale - 1.0) < 1e-3
     if base_width > 0 and has_scale and not is_native:
@@ -226,6 +226,24 @@ def pyramid_level_record(
     else:
         level_text = f"{source_width}px"
     return DiagnosticRecord("Pyramid Level", level_text)
+
+
+def _base_raster_item(
+    plan_or_item: SceneRenderPlan | RasterLayerRenderItem,
+) -> RasterLayerRenderItem | None:
+    """Return a raster item from either a render plan or a direct item."""
+    direct_source = getattr(plan_or_item, "source_image", None)
+    if direct_source is not None:
+        return plan_or_item
+    base_item = getattr(plan_or_item, "base_raster_item", None)
+    return base_item if base_item is not None else None
+
+
+def _is_scene_render_plan(
+    plan_or_item: SceneRenderPlan | RasterLayerRenderItem,
+) -> bool:
+    """Return True when ``plan_or_item`` carries scene-level content geometry."""
+    return getattr(plan_or_item, "content_snapshot", None) is not None
 
 
 def _aggregate_cache_record(snapshot: dict[str, object]) -> DiagnosticRecord | None:

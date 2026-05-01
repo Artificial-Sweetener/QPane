@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, TypeVar
 
 from PySide6.QtCore import (
     QEvent,
+    QLineF,
     QObject,
     QPoint,
     QPointF,
@@ -47,6 +48,7 @@ from .concurrency import TaskExecutorProtocol, ThreadPolicy
 from .core import (
     CursorProvider,
     OverlayDrawFn,
+    SceneOverlayDrawFn,
     ToolFactory,
     ToolSignalBinder,
 )
@@ -77,6 +79,10 @@ class ControlMode(str, Enum):
     DRAW_BRUSH = "draw-brush"
     SMART_SELECT = "smart-select"
 
+class ComparisonOrientation(str, Enum):
+    VERTICAL = "vertical"
+    HORIZONTAL = "horizontal"
+
 class DiagnosticsDomain(str, Enum):
     CACHE: str
     SWAP: str
@@ -84,6 +90,10 @@ class DiagnosticsDomain(str, Enum):
     EXECUTOR: str
     RETRY: str
     SAM: str
+
+class CatalogEntry:
+    image: QImage
+    path: Path | None
 
 class OverlayState:
     zoom: float
@@ -93,11 +103,137 @@ class OverlayState:
     current_pan: QPointF
     physical_viewport_rect: QRectF
 
+class QPaneSceneClip:
+    coordinate_space: str
+    rect: QRectF
+
+class QPaneSceneLayer:
+    layer_id: uuid.UUID
+    image_id: uuid.UUID
+    placement: QRectF
+    visible: bool
+    opacity: float
+    clip: QPaneSceneClip | None
+    hit_test: bool
+    role: str
+    metadata: Mapping[str, object]
+
+class QPaneCatalogImageLayerRequest:
+    layer_id: uuid.UUID
+    image_id: uuid.UUID
+    placement: QRectF
+    visible: bool
+    opacity: float
+    clip: QPaneSceneClip | None
+    hit_test: bool
+    role: str
+    metadata: Mapping[str, object]
+
+class QPaneSceneRequest:
+    composition_id: uuid.UUID | None
+    title: str | None
+    bounds: QRectF
+    layers: tuple[QPaneCatalogImageLayerRequest, ...]
+
+class QPaneTemplateLayer:
+    layer_id: uuid.UUID
+    source_slot: str
+    placement: QRectF
+    visible: bool
+    opacity: float
+    clip: QPaneSceneClip | None
+    hit_test: bool
+    role: str
+    metadata: Mapping[str, object]
+
+class QPaneSceneTemplate:
+    template_id: uuid.UUID
+    bounds: QRectF
+    layers: tuple[QPaneTemplateLayer, ...]
+    title: str | None
+
+class QPaneSceneTemplateBindings:
+    composition_id: uuid.UUID | None
+    title: str | None
+    catalog_images: Mapping[str, uuid.UUID]
+    metadata: Mapping[str, Mapping[str, object]]
+
+class QPaneScene:
+    composition_id: uuid.UUID
+    scene_id: uuid.UUID
+    title: str
+    bounds: QRectF
+    layers: tuple[QPaneSceneLayer, ...]
+
+class QPaneSceneHit:
+    composition_id: uuid.UUID
+    scene_id: uuid.UUID
+    layer_id: uuid.UUID
+    image_id: uuid.UUID
+    role: str
+    metadata: Mapping[str, object]
+    panel_point: QPointF
+    scene_point: QPointF
+    source_point: QPointF
+
+class QPaneSceneOverlayLayer:
+    layer_id: uuid.UUID
+    image_id: uuid.UUID
+    role: str
+    metadata: Mapping[str, object]
+    placement: QRectF
+    source_size: QSize
+    transform: QTransform
+    panel_bounds: QRectF
+    visible: bool
+
+class QPaneSceneOverlayState:
+    zoom: float
+    qpane_rect: QRect
+    physical_viewport_rect: QRectF
+    composition_id: uuid.UUID
+    scene_id: uuid.UUID
+    scene_bounds: QRectF
+    layers: tuple[QPaneSceneOverlayLayer, ...]
+
 class PanelHitTest:
     panel_point: QPoint
     raw_point: QPointF
     clamped_point: QPoint
     inside_image: bool
+
+class ComparisonState:
+    enabled: bool
+    source_id: uuid.UUID | None
+    source_path: Path | None
+    source_kind: str | None
+    split_position: float
+    orientation: ComparisonOrientation
+
+class ComparisonDividerState:
+    enabled: bool
+    interactive: bool
+    hovered: bool
+    dragging: bool
+    orientation: ComparisonOrientation
+    hit_width: float
+    full_segment: QLineF | None
+    visible_segment: QLineF | None
+
+class CompositionEntry:
+    composition_id: uuid.UUID
+    kind: str
+    title: str
+    source_image_ids: tuple[uuid.UUID, ...]
+    current_image_id: uuid.UUID | None
+    comparison: ComparisonState
+    scene_layer_count: int
+    scene_bounds: QRectF | None
+
+class CompositionSnapshot:
+    compositions: dict[uuid.UUID, CompositionEntry]
+    order: tuple[uuid.UUID, ...]
+    current_composition_id: uuid.UUID | None
 
 class Config:
     def __init__(self, **overrides: Any) -> None: ...
@@ -149,6 +285,10 @@ class QPane(QWidget):
     linkGroupsChanged: Signal
     diagnosticsOverlayToggled: Signal
     diagnosticsDomainToggled: Signal
+    comparisonChanged: Signal
+    compositionChanged: Signal
+    compositionSelectionChanged: Signal
+    sceneChanged: Signal
     samCheckpointStatusChanged: Signal
     samCheckpointProgress: Signal
 
@@ -168,6 +308,10 @@ class QPane(QWidget):
         paths: Iterable[Path | None] | None = ...,
         ids: Iterable[uuid.UUID] | None = ...,
     ) -> ImageMap: ...
+    @staticmethod
+    def fitSceneRect(source_size: QSize, target_rect: QRectF) -> QRectF: ...
+    @staticmethod
+    def fillSceneRect(source_size: QSize, target_rect: QRectF) -> QRectF: ...
     @property
     def settings(self) -> Config: ...
     @settings.setter
@@ -176,7 +320,7 @@ class QPane(QWidget):
     def installedFeatures(self) -> tuple[str, ...]: ...
     def placeholderActive(self) -> bool: ...
     @property
-    def currentImage(self) -> QImage: ...
+    def currentImage(self) -> QImage | None: ...
     @property
     def currentImagePath(self) -> Path | None: ...
     @property
@@ -188,6 +332,9 @@ class QPane(QWidget):
     def imageIDs(self) -> list[uuid.UUID]: ...
     def hasImages(self) -> bool: ...
     def linkedGroups(self) -> tuple[LinkedGroup, ...]: ...
+    def currentCompositionID(self) -> uuid.UUID | None: ...
+    def compositionIDs(self) -> list[uuid.UUID]: ...
+    def getCompositionSnapshot(self) -> CompositionSnapshot: ...
     def activeMaskID(self) -> uuid.UUID | None: ...
     def maskIDsForImage(self, image_id: uuid.UUID | None = ...) -> list[uuid.UUID]: ...
     def listMasksForImage(
@@ -229,6 +376,30 @@ class QPane(QWidget):
     ) -> None: ...
     def unregisterOverlay(self, name: str) -> None: ...
     def contentOverlays(self) -> Mapping[str, OverlayDrawFn]: ...
+    def composeScene(
+        self,
+        request: QPaneSceneRequest,
+        *,
+        activate: bool = ...,
+        fit_view: bool = ...,
+    ) -> uuid.UUID: ...
+    def composeSceneFromTemplate(
+        self,
+        template: QPaneSceneTemplate,
+        bindings: QPaneSceneTemplateBindings,
+        *,
+        activate: bool = ...,
+        fit_view: bool = ...,
+    ) -> uuid.UUID: ...
+    def currentScene(self) -> QPaneScene | None: ...
+    def sceneHitTest(self, panel_pos: QPoint) -> QPaneSceneHit | None: ...
+    def registerSceneOverlay(
+        self,
+        name: str,
+        draw_fn: SceneOverlayDrawFn,
+    ) -> None: ...
+    def unregisterSceneOverlay(self, name: str) -> None: ...
+    def sceneOverlays(self) -> Mapping[str, SceneOverlayDrawFn]: ...
     def overlaysSuspended(self) -> bool: ...
     def overlaysResumePending(self) -> bool: ...
     def resumeOverlays(self) -> None: ...
@@ -256,6 +427,14 @@ class QPane(QWidget):
     def setCurrentImageID(self, image_id: uuid.UUID | None) -> None: ...
     def setAllImagesLinked(self, enabled: bool) -> None: ...
     def setLinkedGroups(self, groups: Iterable[LinkedGroup]) -> None: ...
+    def compose(
+        self,
+        *,
+        images: Iterable[uuid.UUID],
+        title: str | None = ...,
+    ) -> uuid.UUID: ...
+    def openComposition(self, composition_id: uuid.UUID) -> None: ...
+    def removeComposition(self, composition_id: uuid.UUID) -> None: ...
     def getCatalogSnapshot(self) -> CatalogSnapshot: ...
     def createBlankMask(self, size: QSize) -> uuid.UUID | None: ...
     def loadMaskFromFile(self, path: str) -> uuid.UUID | None: ...
@@ -278,3 +457,14 @@ class QPane(QWidget):
         self,
         mode: str,
     ) -> None: ...
+    def setComparisonImageID(self, image_id: uuid.UUID) -> None: ...
+    def clearComparisonImage(self) -> None: ...
+    def setComparisonSplit(
+        self,
+        position: float,
+        orientation: ComparisonOrientation | str | None = ...,
+    ) -> None: ...
+    def comparisonState(self) -> ComparisonState: ...
+    def comparisonDividerInteractive(self) -> bool: ...
+    def setComparisonDividerInteractive(self, enabled: bool) -> None: ...
+    def comparisonDividerState(self) -> ComparisonDividerState: ...

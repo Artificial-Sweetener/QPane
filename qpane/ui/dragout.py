@@ -21,19 +21,27 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QMimeData, Qt, QUrl
-from PySide6.QtGui import QDrag, QGuiApplication, QMouseEvent, QPixmap
+from PySide6.QtGui import QDrag, QGuiApplication, QImage, QMouseEvent, QPixmap
 
 if TYPE_CHECKING:
     from ..qpane import QPane
 logger = logging.getLogger(__name__)
 
 
-def maybeStartDrag(qpane: "QPane", event: QMouseEvent | None) -> None:
+def maybeStartDrag(
+    qpane: "QPane",
+    event: QMouseEvent | None,
+    *,
+    image: QImage | None = None,
+    path: Path | None = None,
+) -> None:
     """Start an OS-level drag for the qpane's current image once prerequisites are met.
 
     Args:
-        qpane: QPane initiating the drag; must expose ``currentImagePath`` and ``original_image``.
+        qpane: QPane initiating the drag.
         event: Mouse event forwarded from Qt; accepted only to match the slot signature.
+        image: Base image payload used for the drag preview.
+        path: Filesystem path offered to the OS drag target.
 
     Side effects:
         Emits a ``QDrag`` with the current image file so external apps can receive the payload.
@@ -42,7 +50,7 @@ def maybeStartDrag(qpane: "QPane", event: QMouseEvent | None) -> None:
         The camelCase name aligns with Qt signal wiring (``drag_start_maybe_requested``), so callers do not need shims.
     """
     del event
-    current_path = qpane.currentImagePath
+    current_path = path if path is not None else qpane.currentImagePath
     if current_path is None:
         logger.warning("maybeStartDrag aborted: current image path is missing.")
         return
@@ -54,9 +62,10 @@ def maybeStartDrag(qpane: "QPane", event: QMouseEvent | None) -> None:
             current_path,
         )
         return
-    if qpane.original_image.isNull():
+    preview_image = image if image is not None else qpane.currentImage
+    if preview_image is None or preview_image.isNull():
         logger.warning(
-            "maybeStartDrag aborted: original image is null for %s.",
+            "maybeStartDrag aborted: current image is null for %s.",
             current_path,
         )
         return
@@ -71,7 +80,7 @@ def maybeStartDrag(qpane: "QPane", event: QMouseEvent | None) -> None:
     screen_size = screen.availableGeometry().size()
     max_drag_width = int(screen_size.width() * 0.15)
     max_drag_height = int(screen_size.height() * 0.15)
-    preview_pixmap = QPixmap.fromImage(qpane.original_image).scaled(
+    preview_pixmap = QPixmap.fromImage(preview_image).scaled(
         max_drag_width,
         max_drag_height,
         Qt.AspectRatioMode.KeepAspectRatio,

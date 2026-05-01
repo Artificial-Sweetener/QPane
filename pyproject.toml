@@ -69,6 +69,7 @@ include = ["qpane", "qpane.*", "examples"]
 zip-safe = false
 
 [tool.pytest.ini_options]
+addopts = ["--basetemp=.pytest-tmp"]
 markers = [
   "performance: mark long-running performance benchmarks",
   "swap_benchmark: mark swap latency benchmarks",

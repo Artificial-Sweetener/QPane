@@ -36,30 +36,38 @@ if modes:
 ## Built-in Modes
 QPane comes with core navigation modes ready to use. You can refer to them via the `ControlMode` enum or the string constants on `QPane`.
 
-*   **Pan/Zoom (`ControlMode.PANZOOM`):** The default. Users drag to pan and scroll to zoom. Double-clicking toggles between "fit" and "1:1" views. Wheel steps snap to 100% when crossing it, so you never skip the native scale. Use this for standard navigation.
-*   **Cursor (`ControlMode.CURSOR`):** "Look but don't touch." The viewport stays locked, and drag/scroll events are ignored. This is perfect for kiosks or when you want to handle mouse events yourself without the image moving.
+* **Pan/Zoom (`ControlMode.PANZOOM`):** The default. Users drag to pan and scroll to zoom. Double-clicking toggles between "fit" and "1:1" views. Wheel steps snap to 100% when crossing it, so you never skip the native scale. Use `QPane.CONTROL_MODE_PANZOOM` when a toolbar or shortcut should return to normal navigation.
+* **Cursor (`ControlMode.CURSOR`):** "Look but don't touch." The viewport stays locked, and drag/scroll events are ignored. Use `QPane.CONTROL_MODE_CURSOR` for read-only states, kiosks, or hosts that handle pointer events outside the viewer.
 
-If you have installed the `mask` or `sam` extras, you will also see `ControlMode.DRAW_BRUSH` and `ControlMode.SMART_SELECT`. These modes are unavailable when the catalog is empty. See [Masks and SAM](masks-and-sam.md) for details.
+If you have installed the `mask` or `sam` extras, you will also see `ControlMode.DRAW_BRUSH` and `ControlMode.SMART_SELECT`. Use `QPane.CONTROL_MODE_DRAW_BRUSH` for the raster mask brush and `QPane.CONTROL_MODE_SMART_SELECT` for the SAM box-selection tool. These modes are unavailable when the catalog is empty. See [Masks and SAM](masks-and-sam.md) for details.
 
 ## View State
-You can control how the image fits into the viewport using `ZoomMode`.
-*   `ZoomMode.FIT`: Always keep the whole image visible.
-*   `ZoomMode.LOCKED_ZOOM`: Keep pixels 1:1 (great for inspection).
-*   `ZoomMode.LOCKED_SIZE`: Keep the viewport size constant.
+You can control how placeholder and startup image fitting works using `ZoomMode`. `ZoomMode.FIT` keeps the whole image visible, `ZoomMode.LOCKED_ZOOM` keeps the configured zoom value stable for inspection workflows, and `ZoomMode.LOCKED_SIZE` keeps the rendered placeholder size stable when the viewport changes.
+
+Choose `PlaceholderScaleMode` based on what the empty viewer should measure against:
+
+* `PlaceholderScaleMode.AUTO` uses QPane's default placeholder rule for normal host applications.
+* `PlaceholderScaleMode.LOGICAL_FIT` fits the logical widget viewport when host chrome is measured in widget coordinates.
+* `PlaceholderScaleMode.PHYSICAL_FIT` fits the device-pixel viewport when high-DPI pixel alignment matters.
+* `PlaceholderScaleMode.RELATIVE_FIT` scales the placeholder relative to the configured viewport policy for specialized placeholder layouts.
 
 Want to know how deep you are? `QPane.currentZoom` tells you the current multiplier.
 
 ## Interaction Rules
-*   **Persistence:** Modes stick around. If you switch to "Brush" mode and navigate to the next image, you remain in "Brush" mode.
-*   **Overlays:** Switching modes often changes the cursor and may show or hide overlays (like the brush circle).
-*   **Validation:** `setControlMode` safely handles missing features (like trying to use Smart Select without SAM installed) by logging a warning and ignoring the request. However, it raises a `ValueError` if passed an unknown mode ID.
-*   **Event Delivery:** Tools always expose the full Qt event surface via concrete no-op handlers, so dispatch is direct and predictable—override only what you need.
+* **Persistence:** Modes stick around. If you switch to "Brush" mode and navigate to the next image, you remain in "Brush" mode.
+* **Overlays:** Switching modes often changes the cursor and may show or hide overlays (like the brush circle).
+* **Validation:** `setControlMode` safely handles missing features (like trying to use Smart Select without SAM installed) by logging a warning and ignoring the request. However, it raises a `ValueError` if passed an unknown mode ID.
+* **Event Delivery:** Tools always expose the full Qt event surface via concrete no-op handlers, so dispatch is direct and predictable—override only what you need.
+### Comparison Divider Interaction
+Split comparison uses the normal viewer modes and belongs to the active composition. QPane owns built-in split-boundary dragging as interaction chrome, not image content. QPane does not paint a divider line or handle; the visible boundary between the base and comparison images is the drag target.
+
+Host controls can call `QPane.setComparisonSplit` directly to move the boundary. Use `QPane.comparisonDividerState` when the host wants to draw its own divider overlay from authoritative geometry. `QPane.setComparisonDividerInteractive` disables or restores built-in dragging, and `QPane.comparisonDividerInteractive` reports the current interaction setting for checkboxes or toolbar state.
 
 > **Pro Tip:** Want the best of both worlds? QPane includes a built-in "hold Space to pan" feature that temporarily switches to `CONTROL_MODE_PANZOOM` while the widget has focus. For a global implementation that works even when focus is elsewhere (like in the demo), see `examples/demonstration/demo_window.py`.
 
 ## Related Docs
-*   [Masks and SAM](masks-and-sam.md): Details on the brush and smart selection tools.
-*   [Extensibility](extensibility.md): How to register your own custom tools and cursors.
-*   [Catalog and Navigation](catalog-and-navigation.md): Managing the images you are interacting with.
+* [Masks and SAM](masks-and-sam.md): Details on the brush and smart selection tools.
+* [Extensibility](extensibility.md): How to register your own custom tools and cursors.
+* [Catalog and Navigation](catalog-and-navigation.md): Managing the images you are interacting with.
 
 **Continue →** [Masks and SAM](masks-and-sam.md)

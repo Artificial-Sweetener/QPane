@@ -39,7 +39,7 @@ import numpy as np
 
 from PySide6.QtCore import QRect, QSize
 
-from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QTransform, Qt
+from PySide6.QtGui import QColor, QCursor, QImage, Qt
 
 
 from ..core import Config
@@ -386,59 +386,11 @@ class Masks:
         qpane = self._qpane
         interaction = qpane.interaction
         interaction.unregisterOverlay("mask")
-        interaction.registerOverlay("mask", self._draw_mask_overlay)
         interaction.unregisterCursorProvider(qpane.CONTROL_MODE_DRAW_BRUSH)
         interaction.registerCursorProvider(
             qpane.CONTROL_MODE_DRAW_BRUSH,
             self._brush_cursor_adapter.cursor_provider,
         )
-
-    def _draw_mask_overlay(self, painter, state) -> None:
-        """Render mask layers above the base image when available."""
-        catalog = self._catalog
-        try:
-            current_id = catalog.currentImageID()
-        except AttributeError:
-            return
-        if current_id is None:
-            return
-        service = self._ensure_mask_service()
-        if service is None:
-            return
-        mask_manager = getattr(service, "manager", None)
-        if mask_manager is None:
-            return
-        try:
-            layers = mask_manager.get_masks_for_image(current_id)
-        except Exception:  # pragma: no cover - defensive guard
-            logger.exception("Failed to fetch mask layers for overlay")
-            return
-        if not layers:
-            return
-        painter.save()
-        try:
-            mask_transform = QTransform(state.transform)
-            painter.setTransform(mask_transform)
-            view = self._qpane.view()
-            viewport = getattr(view, "viewport", None)
-            native_zoom = viewport.nativeZoom() if viewport is not None else 1.0
-            if state.zoom < native_zoom * 2.0:
-                painter.setRenderHint(
-                    QPainter.RenderHint.SmoothPixmapTransform,
-                    True,
-                )
-            original_image = self._qpane.original_image
-            scale = None
-            if not original_image.isNull() and original_image.width() > 0:
-                scale = state.source_image.width() / original_image.width()
-            for mask_layer in layers:
-                pixmap = service.getColorizedMask(mask_layer, scale=scale)
-                if pixmap:
-                    painter.setOpacity(getattr(mask_layer, "opacity", 1.0))
-                    painter.drawPixmap(0, 0, pixmap)
-        finally:
-            painter.setOpacity(1.0)
-            painter.restore()
 
     def on_navigation_started(self, event: "NavigationEvent") -> None:
         """Record navigation metadata and suspend overlays when needed."""
@@ -932,7 +884,7 @@ class Masks:
         )
 
     def invalidate_active_mask_cache(self) -> bool:
-        """Invalidate cached mask overlays for the active mask."""
+        """Invalidate cached mask renders for the active mask."""
         return self._undo_api.invalidate_active_mask_cache()
 
     # Brush / cursor --------------------------------------------------------

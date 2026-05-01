@@ -96,7 +96,7 @@ def draw_overlay(painter, state):
 
     QPane calls this hook during overlay repaints; exit early when inactive.
     """
-    image = qpane.currentImage
+    image = state.source_image
     if qpane.getControlMode() != CUSTOM_MODE or image.isNull():
         return
     if state.zoom >= 1.0:

@@ -195,12 +195,12 @@ def test_cycle_updates_mask_order():
         first_mask,
         second_mask,
     ]
-    manager.cycle_mask_order(image_id, forward=True)
+    manager.reorder_mask(image_id, first_mask, 1)
     assert manager.get_mask_ids_for_image(image_id) == [
         second_mask,
         first_mask,
     ]
-    manager.bring_mask_to_top(image_id, second_mask)
+    manager.reorder_mask(image_id, second_mask, 1)
     assert manager.get_mask_ids_for_image(image_id) == [
         first_mask,
         second_mask,

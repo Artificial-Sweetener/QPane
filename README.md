@@ -5,9 +5,9 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE) [![semantic-release](https://img.shields.io/badge/semantic--release-angular-e10079?logo=semantic-release)](https://github.com/semantic-release/semantic-release) [![PyPI](https://img.shields.io/pypi/v/qpane.svg)](https://pypi.org/project/qpane/) [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/) [![PySide6](https://img.shields.io/badge/PySide6-6.7.3%2B-41CD52?logo=qt&logoColor=white)](https://pyside.org) [![OpenCV optional](https://img.shields.io/badge/OpenCV-optional%204.9%2B-5C3EE8?logo=opencv&logoColor=white)](https://opencv.org/) [![PyTorch optional](https://img.shields.io/badge/PyTorch-optional%202.1%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 
-**QPane** is a high-performance, **open-source (GPLv3)** image viewer and raster canvas for PySide6.
+**QPane** is a high-performance, **open-source (GPLv3)** image viewer, raster canvas, and scene composition widget for PySide6.
 
-It bridges the gap between a raw `QGraphicsView` and a full-blown image editor, providing a drop-in widget for **interactive workflows**—specifically those involving high-resolution image inspection, dataset curation, and precise masking.
+It bridges the gap between a raw `QGraphicsView` and a full-blown image editor, providing a drop-in widget for **interactive workflows**—specifically those involving high-resolution image inspection, dataset curation, scene review, comparison, and precise masking.
 
 Whether you are building a simple photo viewer or a mission-critical imaging system, QPane adapts to your resource constraints.
 
@@ -16,6 +16,7 @@ Whether you are building a simple photo viewer or a mission-critical imaging sys
 *   **True FOSS:** Distributed under GPLv3 to ensure it remains free for everyone. No pro versions, no hidden costs.
 *   **CPU-First Performance:** Renders massive images smoothly using system RAM, ensuring responsiveness on any hardware—from laptops to workstations.
 *   **Fluid Pan & Zoom Navigation:** Silky smooth zooming, panning, and tiling out of the box.
+*   **Scene Compositions:** Arrange catalog images into persistent review grids, contact sheets, two-up views, and layered scenes without flattening pixels.
 *   **Modular Dependencies:** A "pay-for-what-you-use" design means you never install heavy libraries (like Torch or OpenCV) unless you need them.
 *   **Advanced Raster Masking:** Features a full 8-bit masking engine with brush tools, undo/redo, and optional **Segment Anything (SAM)** integration.
 *   **Native High-DPI Support:** Automatically adapts to different monitor pixel densities and OS zoom levels for crisp rendering anywhere.
@@ -68,8 +69,8 @@ QPane rejects the modern "GPU-brute-force" approach in favor of deterministic, C
 I originally built QPane for my **Stable Diffusion frontend**, where the GPU is already at 100% load running inference. I needed a viewer that wouldn't fight the AI model for VRAM. This architecture makes QPane ideal for **any resource-constrained environment**, from scientific imaging on office laptops to embedded systems with limited graphics acceleration.
 
 ### 1. The Raster Pipeline
-QPane behaves less like a scene graph and more like a map engine. Instead of rendering the image, QPane renders the *viewport*.
-*   **Software Tiling:** Large images are sliced into small CPU-resident tiles. Instead of a heavy scene graph, QPane calculates tile visibility using raw coordinate math, eliminating the overhead of managing thousands of `QGraphicsItem` objects.
+QPane avoids Qt's item-heavy scene graph and uses its own raster-first scene model, closer to a map engine than a traditional canvas. Instead of rendering the image, QPane renders the *viewport*.
+*   **Software Tiling:** Large images are sliced into small CPU-resident tiles. Instead of thousands of `QGraphicsItem` objects, QPane resolves lightweight scene layers into visible tile work using raw coordinate math.
 *   **Viewport Culling:** Only the pixels currently visible on screen are processed. You can load a 5GB satellite scan, and QPane will only render the 1920x1080 pixels needed for your monitor.
 *   **Threaded Pyramids:** Background workers generate downsampled versions of your image. When you zoom out, QPane instantly swaps to a lower-resolution tier. This happens in a thread pool, ensuring the UI thread never stutters while loading a 100MB image.
 *   **Bit-Blit Scrolling:** When you pan, QPane doesn't redraw the screen. It shifts the existing pixel buffer and only renders the newly exposed "damage strips" at the edges. This keeps scrolling silky smooth even at high resolutions.
@@ -90,15 +91,17 @@ conf.cache.budget_mb = 4096
 ## Key Features
 
 ### 1. Advanced Viewing Capabilities
+*   **Persistent Compositions:** Every loaded image becomes a default composition, and hosts can create explicit image, comparison, or layered scene compositions for review workflows.
+*   **Catalog-Backed Scenes:** Build contact sheets, two-up layouts, and custom review grids from catalog image IDs. QPane keeps each layer tied to the normal pyramid and tile pipeline.
 *   **Linked Views:** Perfect for "Before/After" workflows. Group multiple images into a **Linked Group**, and panning/zooming one image synchronizes the view state across the entire group.
-*   **Catalog System:** QPane manages the list of images for you. Images are tracked by stable UUIDs, allowing you to swap file paths or buffers without breaking selection state. Includes built-in `next()`, `previous()`, and `setImagesByID()` methods.
+*   **Catalog System:** QPane manages source image identity for you. Images are tracked by stable UUIDs, while compositions define the renderable views your users browse and open. Use `imageIDs()`, `currentImageID()`, and `setCurrentImageID()` to build host-owned navigation controls.
 *   **High-DPI Ready:** QPane detects the pixel density of the monitor it's on and renders at the native resolution. Drag the window between monitors with different OS zoom levels, and QPane instantly rebuilds its render buffers to match the new pixel density without stuttering.
 
 ### 2. The Raster Canvas (Masks & SAM)
-QPane doesn't just have to be a viewer; it can be an interactive canvas, too. It supports a full **8-bit raster masking system** layered on top of your image.
+QPane doesn't just have to be a viewer; it can be an interactive canvas, too. It supports a full **8-bit raster masking system** for image compositions, layered into the same scene pipeline as the base raster.
 *   **Layer Stack:** Multiple mask layers with configurable color and opacity.
 *   **Brush Tool:** A circular brush for manual pixel-level editing.
-*   **Smart Select (SAM):** Integrated support for the **Segment Anything Model**. Drag a box, and QPane runs the AI inference to generate a high-quality mask-all on the CPU. Powered by [MobileSAM](https://github.com/ChaoningZhang/MobileSAM).
+*   **Smart Select (SAM):** Integrated support for the **Segment Anything Model**. Drag a box, and QPane runs the AI inference on the configured SAM device, CPU by default. Powered by [MobileSAM](https://github.com/ChaoningZhang/MobileSAM).
 *   **Undo/Redo:** A robust, per-image undo stack that tracks pixel changes.
 
 <p align="center">
@@ -112,10 +115,10 @@ QPane doesn't just have to be a viewer; it can be an interactive canvas, too. It
 
 ## Developer Experience
 
-QPane is designed to be the library I wish I had. It uses a **Facade Pattern** to hide complexity. You don't interact with tile managers or thread pools directly; you just instantiate the `QPane` widget.
+QPane is designed to be the library I wish I had. It uses a **Facade Pattern** to hide complexity: you work with catalog images, compositions, tools, and signals, while QPane handles scenes, tile managers, and thread pools internally.
 
 *   **Native Qt Feel:** It's a `QWidget`. Add it to a layout, connect signals (`catalogSelectionChanged`, `maskSaved`), and it just works.
-*   **Immutable Config:** No global state spaghetti. Create a `Config` object, set your preferences (cache size, keybindings), and pass it in.
+*   **Snapshot-Style Config:** No global state spaghetti. Create a `Config` object, set your preferences (cache size, keybindings), and pass it in; QPane keeps its own copy for the widget.
 *   **Diagnostics HUD:** Easy to wire into your app. Bind your preferred shortcut to toggle the overlay and see memory usage, render times, and worker queues.
 *   **Lazy Loading:** Importing `qpane` is instant. Heavy dependencies like `cv2` (for masking) `torch` (for SAM) are only imported when you actually use those features.
 
@@ -150,13 +153,15 @@ widget = QPane(features=("mask", "sam"))
 
 # 2. Load Data
 images = [QImage("scan_001.tif"), QImage("scan_002.tif")]
-# QPane.imageMapFromLists generates UUIDs if you don't provide them,
-# but passing your own IDs is recommended for stable tracking.
-ids = ["uuid-1", "uuid-2"]
-mapping = QPane.imageMapFromLists(images, ids=ids)
+# QPane.imageMapFromLists generates UUIDs if you don't provide them.
+mapping = QPane.imageMapFromLists(images)
 
 # Load the map and select the first image
-widget.setImagesByID(mapping, current_id=ids[0])
+first_id = next(iter(mapping))
+widget.setImagesByID(mapping, current_id=first_id)
+
+# Loading the catalog creates default compositions automatically.
+# For review surfaces, build a QPaneSceneRequest and call composeScene().
 
 # 3. Connect Signals
 widget.catalogSelectionChanged.connect(lambda iid: print(f"Now viewing {iid}"))
@@ -169,6 +174,7 @@ widget.maskSaved.connect(lambda mid, path: print(f"Saved mask to {path}"))
 *   **[Configuration](docs/configuration.md):** Learn how to tune the cache, thread pool, and interaction behavior.
 *   **[Configuration Reference](docs/configuration-reference.md):** The complete list of every field and default value.
 *   **[Catalog and Navigation](docs/catalog-and-navigation.md):** Managing image lists and linked views.
+*   **[Scene Composition](docs/scenes.md):** Building contact sheets, layered scenes, templates, hit tests, and scene overlays.
 *   **[Interaction Modes](docs/interaction-modes.md):** Switching between pan/zoom, cursor, and custom tools.
 *   **[Masks and SAM](docs/masks-and-sam.md):** Deep dive into manual painting and AI-powered masking workflows.
 *   **[Diagnostics](docs/diagnostics.md):** How to observe runtime behavior and debug performance.

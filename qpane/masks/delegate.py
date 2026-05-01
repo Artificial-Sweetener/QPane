@@ -92,6 +92,11 @@ class MaskDelegate:
             raise RuntimeError("Mask service already attached")
         qpane.mask_service = service
         qpane.mask_controller = service.controller
+        scene_mutations = getattr(qpane, "sceneMutationCoordinator", None)
+        if callable(scene_mutations) and hasattr(
+            service, "setSceneMutationCoordinator"
+        ):
+            service.setSceneMutationCoordinator(scene_mutations())
         qpane.swapDelegate.on_mask_service_attached(service)
         workflow = qpane._masks_controller
         undo_slot = workflow.on_mask_undo_stack_changed
@@ -110,6 +115,8 @@ class MaskDelegate:
         service = qpane.mask_service
         if service is None:
             return
+        if hasattr(service, "setSceneMutationCoordinator"):
+            service.setSceneMutationCoordinator(None)
         qpane.swapDelegate.on_mask_service_detached()
         try:
             if self._mask_undo_slot is not None:
@@ -220,7 +227,7 @@ class MaskDelegate:
     def prefetch_mask_overlays(
         self, image_id: uuid.UUID | None, *, reason: str = "navigation"
     ) -> bool:
-        """Warm mask overlays for ``image_id`` for the given ``reason``."""
+        """Warm mask renders for ``image_id`` for the given ``reason``."""
         if not self.mask_feature_available():
             return False
         service = self._mask_service
@@ -326,7 +333,7 @@ class MaskDelegate:
         return service.redoActiveMaskEdit()
 
     def invalidate_active_mask_cache(self) -> bool:
-        """Drop cached overlays for the active mask if the service exists."""
+        """Drop cached mask renders for the active mask if the service exists."""
         if not self.mask_feature_available():
             return bool(
                 self._fallbacks().get(

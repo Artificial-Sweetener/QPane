@@ -124,7 +124,7 @@ class TestQThreadPoolExecutor:
         executor._pool_unavailable = True
         executor._pool_unavailable_logged = False
         worker = _CompletionWorker()
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("DEBUG"):
             handle = executor.submit(worker, category="tiles")
         snapshot = executor.snapshot()
         assert snapshot.active_total == 0

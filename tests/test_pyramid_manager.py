@@ -25,27 +25,32 @@ import pytest
 from PySide6.QtGui import QImage, Qt
 from qpane import Config
 from qpane.rendering import ImagePyramid, PyramidManager, PyramidStatus
+from qpane.scene.identity import SceneLayerAssetKey, default_catalog_asset_key
 from tests.helpers.executor_stubs import RejectingStubExecutor, StubExecutor
 
 
 class _DummyExecutor:
-    def __init__(self) -> None:
+    def __init__(self, *, cancel_result: bool = True) -> None:
         self.cancelled = []
+        self.cancel_result = cancel_result
 
     def submit(self, runnable, category: str, *, device: str | None = None):
         raise NotImplementedError
 
     def cancel(self, handle):
         self.cancelled.append(handle)
-        return True
+        return self.cancel_result
 
     def shutdown(self, wait: bool = True):
         return None
 
 
 class _DummyWorker:
+    def __init__(self) -> None:
+        self.cancelled = False
+
     def cancel(self) -> None:
-        return None
+        self.cancelled = True
 
 
 @pytest.fixture
@@ -56,6 +61,22 @@ def sample_image() -> QImage:
     return image
 
 
+def _asset_key(
+    image_id: uuid.UUID | None = None,
+    source_path: Path | None = None,
+    *,
+    revision: int = 0,
+) -> SceneLayerAssetKey:
+    """Return a default-scene asset key for pyramid tests."""
+    if image_id is None:
+        image_id = uuid.uuid4()
+    return default_catalog_asset_key(
+        image_id,
+        revision=revision,
+        source_path=source_path,
+    )
+
+
 @pytest.mark.usefixtures("qapp")
 class TestPyramidManager:
     def test_regeneration_after_cancellation(self, sample_image: QImage, qapp):
@@ -64,17 +85,18 @@ class TestPyramidManager:
         manager = PyramidManager(config=Config(), executor=executor)
         image_id = uuid.uuid4()
         source_path = Path("regen-cancel.png")
+        key = _asset_key(image_id, source_path)
         # Start and cancel
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        manager.generate_pyramid_for_asset(key, sample_image)
         manager.shutdown(wait=False)  # Should cancel all
         qapp.processEvents()
         # Regenerate
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        manager.generate_pyramid_for_asset(key, sample_image)
         pending = list(executor.pending_tasks())
         assert pending
         executor.run_task(pending[0].handle.task_id)
         qapp.processEvents()
-        pyramid = manager.pyramid_for_image_id(image_id)
+        pyramid = manager.pyramid_for_asset(key)
         assert pyramid is not None
         assert pyramid.status == PyramidStatus.COMPLETE
         assert manager.cache_usage_bytes > 0
@@ -88,17 +110,18 @@ class TestPyramidManager:
         manager.cache_limit_bytes = 5000
         image_ids = [uuid.uuid4() for _ in range(3)]
         paths = [Path(f"img-{i}.png") for i in range(3)]
-        for image_id, path in zip(image_ids, paths):
-            manager.generate_pyramid_for_image(image_id, sample_image, path)
+        keys = [_asset_key(image_id, path) for image_id, path in zip(image_ids, paths)]
+        for key in keys:
+            manager.generate_pyramid_for_asset(key, sample_image)
             pending = list(executor.pending_tasks())
             assert pending
             executor.run_task(pending[0].handle.task_id)
             qapp.processEvents()
-        cached = list(manager.iter_cached_ids())
+        cached = list(manager.iter_cached_asset_keys())
         # Only one should remain in cache due to aggressive eviction
         assert len(cached) == 1
         # It should be the most recently used before the last insertion (img-1.png)
-        assert cached[0] == image_ids[1]
+        assert cached[0] == keys[1]
 
     def test_cache_budget_enforcement(self, sample_image: QImage, qapp):
         """Cache usage should not exceed the configured budget after eviction."""
@@ -110,7 +133,7 @@ class TestPyramidManager:
         for i in range(5):
             image_id = uuid.uuid4()
             path = Path(f"budget-{i}.png")
-            manager.generate_pyramid_for_image(image_id, sample_image, path)
+            manager.generate_pyramid_for_asset(_asset_key(image_id, path), sample_image)
             pending = list(executor.pending_tasks())
             assert pending
             executor.run_task(pending[0].handle.task_id)
@@ -123,14 +146,15 @@ class TestPyramidManager:
         manager = PyramidManager(config=Config(), executor=executor)
         image_id = uuid.uuid4()
         source_path = Path("cancel-me.png")
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        key = _asset_key(image_id, source_path)
+        manager.generate_pyramid_for_asset(key, sample_image)
         # Simulate cancellation before worker starts
         manager.shutdown(wait=False)
         qapp.processEvents()
-        pyramid = manager.pyramid_for_image_id(image_id)
+        pyramid = manager.pyramid_for_asset(key)
         assert pyramid is not None
         assert pyramid.status != PyramidStatus.COMPLETE
-        assert image_id not in manager.iter_cached_ids()
+        assert key not in manager.iter_cached_asset_keys()
 
     """Tests for pyramid generation and eviction behaviour under the stub executor."""
 
@@ -142,7 +166,9 @@ class TestPyramidManager:
         manager = PyramidManager(config=Config(), executor=executor)
         image_id = uuid.uuid4()
         source_path = Path("image-a.png")
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        manager.generate_pyramid_for_asset(
+            _asset_key(image_id, source_path), sample_image
+        )
         pending = list(executor.pending_tasks())
         assert pending and pending[0].handle.category == "pyramid"
         executor.run_task(pending[0].handle.task_id)
@@ -165,10 +191,14 @@ class TestPyramidManager:
         source_path = Path("image-b.png")
         second_id = uuid.uuid4()
         second_path = Path("image-b2.png")
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        manager.generate_pyramid_for_asset(
+            _asset_key(image_id, source_path), sample_image
+        )
         first = next(executor.pending_tasks())
         executor.run_task(first.handle.task_id)
-        manager.generate_pyramid_for_image(second_id, sample_image, second_path)
+        manager.generate_pyramid_for_asset(
+            _asset_key(second_id, second_path), sample_image
+        )
         second = next(
             task for task in executor.pending_tasks() if task.handle != first.handle
         )
@@ -195,10 +225,14 @@ class TestPyramidManager:
         source_path = Path("image-c.png")
         second_id = uuid.uuid4()
         second_path = Path("image-c2.png")
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
+        manager.generate_pyramid_for_asset(
+            _asset_key(image_id, source_path), sample_image
+        )
         first = next(executor.pending_tasks())
         executor.run_task(first.handle.task_id)
-        manager.generate_pyramid_for_image(second_id, sample_image, second_path)
+        manager.generate_pyramid_for_asset(
+            _asset_key(second_id, second_path), sample_image
+        )
         second = next(
             task for task in executor.pending_tasks() if task.handle != first.handle
         )
@@ -220,12 +254,13 @@ class TestPyramidManager:
         manager = PyramidManager(config=Config(), executor=executor)
         image_id = uuid.uuid4()
         source_path = Path("throttled.png")
-        throttled: list[tuple[uuid.UUID, int]] = []
+        key = _asset_key(image_id, source_path)
+        throttled: list[tuple[SceneLayerAssetKey, int]] = []
         manager.pyramidThrottled.connect(
             lambda predictor_id, attempt: throttled.append((predictor_id, attempt))
         )
-        manager.generate_pyramid_for_image(image_id, sample_image, source_path)
-        assert throttled == [(image_id, 1)]
+        manager.generate_pyramid_for_asset(key, sample_image)
+        assert throttled == [(key, 1)]
         assert executor.rejections
 
         def wait_for(predicate, *, timeout: float = 1.0) -> None:
@@ -247,10 +282,10 @@ class TestPyramidManager:
         assert pending
         executor.run_task(pending[0].handle.task_id)
         wait_for(
-            lambda: manager.pyramid_for_image_id(image_id) is not None
-            and manager.pyramid_for_image_id(image_id).status == PyramidStatus.COMPLETE
+            lambda: manager.pyramid_for_asset(key) is not None
+            and manager.pyramid_for_asset(key).status == PyramidStatus.COMPLETE
         )
-        pyramid = manager.pyramid_for_image_id(image_id)
+        pyramid = manager.pyramid_for_asset(key)
         assert pyramid is not None
         assert pyramid.status == PyramidStatus.COMPLETE
 
@@ -276,49 +311,104 @@ class TestPyramidManager:
         manager = PyramidManager(config=Config(), executor=StubExecutor())
         image_id = uuid.uuid4()
         source_path = Path("prefetch-complete.png")
-        pyramid = ImagePyramid(
-            image_id=image_id,
-            source_path=source_path,
-            full_resolution_image=sample_image,
-        )
+        key = _asset_key(image_id, source_path)
+        pyramid = ImagePyramid(asset_key=key, full_resolution_image=sample_image)
         pyramid.status = PyramidStatus.COMPLETE
-        manager._pyramids[image_id] = pyramid
-        scheduled = manager.prefetch_pyramid(image_id, sample_image, source_path)
+        manager._pyramids[key] = pyramid
+        scheduled = manager.prefetch_pyramid(key, sample_image)
         assert scheduled is False
         metrics = manager.snapshot_metrics()
         assert metrics.prefetch_completed >= 1
 
-    def test_prefetch_pyramid_raises_on_missing_image_id(
+    def test_prefetch_pyramid_raises_on_missing_asset_key(
         self, sample_image: QImage
     ) -> None:
         manager = PyramidManager(config=Config(), executor=StubExecutor())
         with pytest.raises(ValueError):
-            manager.prefetch_pyramid(None, sample_image, None)  # type: ignore[arg-type]
+            manager.prefetch_pyramid(None, sample_image)  # type: ignore[arg-type]
 
-    def test_generate_pyramid_raises_on_missing_image_id(
+    def test_generate_pyramid_raises_on_missing_asset_key(
         self, sample_image: QImage
     ) -> None:
         manager = PyramidManager(config=Config(), executor=StubExecutor())
         with pytest.raises(ValueError):
-            manager.generate_pyramid_for_image(None, sample_image, None)  # type: ignore[arg-type]
+            manager.generate_pyramid_for_asset(None, sample_image)  # type: ignore[arg-type]
 
     def test_remove_pyramid_raises_on_missing_path(self):
         manager = PyramidManager(config=Config(), executor=StubExecutor())
         with pytest.raises(ValueError):
             manager.remove_pyramid(None)  # type: ignore[arg-type]
 
+    def test_remove_pyramid_purges_matching_image_state(
+        self, sample_image: QImage, qapp
+    ) -> None:
+        manager = PyramidManager(config=Config(), executor=StubExecutor())
+        first_id = uuid.uuid4()
+        second_id = uuid.uuid4()
+        first_key = _asset_key(first_id, Path("first.png"))
+        second_key = _asset_key(second_id, Path("second.png"))
+        first_pyramid = ImagePyramid(
+            asset_key=first_key,
+            full_resolution_image=sample_image,
+        )
+        first_pyramid.size_bytes = 64
+        second_pyramid = ImagePyramid(
+            asset_key=second_key,
+            full_resolution_image=sample_image,
+        )
+        second_pyramid.size_bytes = 128
+        manager._pyramids[first_key] = first_pyramid
+        manager._pyramids[second_key] = second_pyramid
+        manager._cache[first_key] = first_pyramid
+        manager._cache[second_key] = second_pyramid
+        manager._cache_size_bytes = first_pyramid.size_bytes + second_pyramid.size_bytes
+        manager._active_handles[first_key] = object()
+        manager._active_workers[first_key] = _DummyWorker()
+        manager._prefetch_begin(first_key)
+        manager.remove_pyramid(first_key)
+        assert first_key not in manager._pyramids
+        assert first_key not in manager._cache
+        assert first_key not in manager._active_handles
+        assert first_key not in manager._active_workers
+        assert not manager._prefetch_pending(first_key)
+        assert manager._pyramids[second_key] is second_pyramid
+        assert manager._cache[second_key] is second_pyramid
+        assert manager.cache_usage_bytes == second_pyramid.size_bytes
+
+    def test_remove_pyramid_cancels_active_generation(
+        self, sample_image: QImage, qapp
+    ) -> None:
+        manager = PyramidManager(config=Config(), executor=StubExecutor())
+        executor = _DummyExecutor(cancel_result=False)
+        manager._executor = executor
+        key = _asset_key(uuid.uuid4(), Path("remove-active.png"))
+        handle = object()
+        worker = _DummyWorker()
+        pyramid = ImagePyramid(asset_key=key, full_resolution_image=sample_image)
+        manager._pyramids[key] = pyramid
+        manager._active_handles[key] = handle
+        manager._active_workers[key] = worker
+        manager._prefetch_begin(key)
+        manager.remove_pyramid(key)
+        assert executor.cancelled == [handle]
+        assert worker.cancelled is True
+        assert key not in manager._active_handles
+        assert key not in manager._active_workers
+        assert key not in manager._pyramids
+        assert not manager._prefetch_pending(key)
+
     def test_cancel_prefetch_updates_metrics(self, sample_image: QImage, qapp):
         manager = PyramidManager(config=Config(), executor=StubExecutor())
         manager._executor = _DummyExecutor()
-        image_id = uuid.uuid4()
-        manager._prefetch_begin(image_id)
-        manager._active_handles[image_id] = object()
-        manager._active_workers[image_id] = _DummyWorker()
-        cancelled = manager.cancel_prefetch([image_id])
-        assert cancelled == [image_id]
+        key = _asset_key()
+        manager._prefetch_begin(key)
+        manager._active_handles[key] = object()
+        manager._active_workers[key] = _DummyWorker()
+        cancelled = manager.cancel_prefetch([key])
+        assert cancelled == [key]
         metrics = manager.snapshot_metrics()
         assert metrics.prefetch_failed >= 1
-        assert not manager._prefetch_pending(image_id)
+        assert not manager._prefetch_pending(key)
 
     def test_pyramid_guard_rejects_oversized_item(
         self, caplog: pytest.LogCaptureFixture, qapp
@@ -337,14 +427,15 @@ class TestPyramidManager:
         large_image.fill(Qt.white)
         image_id = uuid.uuid4()
         source_path = Path("oversize-pyramid.png")
+        key = _asset_key(image_id, source_path)
         with caplog.at_level(logging.WARNING):
-            manager.generate_pyramid_for_image(image_id, large_image, source_path)
+            manager.generate_pyramid_for_asset(key, large_image)
             pending = list(executor.pending_tasks())
             assert pending
             executor.run_task(pending[0].handle.task_id)
             qapp.processEvents()
         assert manager.cache_usage_bytes == 0
-        assert list(manager.iter_cached_ids()) == []
+        assert list(manager.iter_cached_asset_keys()) == []
         warnings = [
             record for record in caplog.records if "not cached" in record.message
         ]

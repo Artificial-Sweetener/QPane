@@ -73,6 +73,8 @@ from examples.demo_settings import load_demo_settings, save_demo_settings
 
 from examples.demonstration import hooks_examples, demo_text
 
+from examples.demonstration import scene_composition
+
 from examples.demonstration.custom_tool import build_custom_cursor_tool
 
 from examples.demonstration.hooks_editor import HookEditorWindow
@@ -92,7 +94,7 @@ from examples.demonstration.catalog.builders import build_catalog_snapshot
 
 from examples.demonstration.workers import ImageLoaderWorker
 
-from qpane import QPane, Config
+from qpane import ComparisonOrientation, QPane, Config
 
 
 _DIAGNOSTIC_DOMAIN_FIELD = "diagnostics_domains_enabled"
@@ -185,7 +187,7 @@ class ExampleOptions:
 
 
 class ExampleWindow(QMainWindow):
-    """Compose the example QPane with catalog/config UI using only facade collaborators.
+    """Compose the example QPane with catalog and configuration UI.
 
     Tutorial flow:
     - Configure settings and create the QPane (``_build_qpane``).
@@ -196,16 +198,9 @@ class ExampleWindow(QMainWindow):
       ``_create_menus``, ``_build_toolbars``).
     - Finalize startup state (``_finalize_startup``).
 
-    Extension seams:
-    - Add gallery/mask/SAM/diagnostics actions in the builders below; wire through
-      ``qpane.linkedGroups()``, ``qpane.diagnosticsOverlayEnabled()``,
-      and the ``QPane.register*`` facade helpers rather than private attributes.
-    - Use ``_build_catalog_panel`` to attach custom dock widgets fed by QPane signals
-      (``catalogChanged``, ``catalogSelectionChanged``) and snapshots pulled via
-      ``build_catalog_snapshot(qpane)``.
-    - Register overlays, cursors, and custom tools via ``QPane.registerOverlay``,
-      ``QPane.registerCursorProvider``, and ``QPane.registerTool`` to keep hooks on the public
-      surface.
+    The builders below show how a host can wire catalog snapshots, menus,
+    status labels, masks, SAM actions, diagnostics, overlays, cursors, and
+    custom tools around a QPane instance.
     """
 
     def __init__(self, options: ExampleOptions, *, config: Config | None = None):
@@ -598,7 +593,7 @@ class ExampleWindow(QMainWindow):
         if label is None:
             return
         image = self.qpane.currentImage
-        if image.isNull():
+        if image is None or image.isNull():
             label.setText("-- x --px")
             return
         size = image.size()
@@ -661,7 +656,8 @@ class ExampleWindow(QMainWindow):
         """Ensure a mask exists and is active before enabling mask-dependent modes."""
         if not self._mask_tools_available():
             return False
-        if self.qpane.currentImage.isNull():
+        image = self.qpane.currentImage
+        if image is None or image.isNull():
             self._set_status("Load an image before using mask tools.")
             return False
         if self.qpane.activeMaskID() is not None:
@@ -764,24 +760,84 @@ class ExampleWindow(QMainWindow):
         """Rotate masks backward via the qpane."""
         self.qpane.cycleMasksBackward()
 
+    def _compare_with_next_image(self) -> None:
+        """Compare the current image with the next catalog image."""
+        image_ids = self.qpane.imageIDs()
+        current_id = self.qpane.currentImageID()
+        if current_id not in image_ids or len(image_ids) < 2:
+            self._set_status("Load at least two images before comparing.")
+            return
+        next_id = image_ids[(image_ids.index(current_id) + 1) % len(image_ids)]
+        self.qpane.setComparisonImageID(next_id)
+        self.qpane.setComparisonSplit(0.5, ComparisonOrientation.VERTICAL)
+        self._set_status(
+            "Comparison enabled. Drag the image boundary to move the split."
+        )
+
+    def _flip_compare_orientation(self) -> None:
+        """Toggle the comparison split orientation."""
+        state = self.qpane.comparisonState()
+        next_orientation = (
+            ComparisonOrientation.HORIZONTAL
+            if state.orientation == ComparisonOrientation.VERTICAL
+            else ComparisonOrientation.VERTICAL
+        )
+        self.qpane.setComparisonSplit(state.split_position, next_orientation)
+        self._set_status(f"Comparison split: {next_orientation.value}.")
+
+    def _clear_compare_image(self) -> None:
+        """Clear the active comparison image."""
+        self.qpane.clearComparisonImage()
+        self._set_status("Comparison cleared.")
+
+    def _compose_contact_sheet_scene(self) -> None:
+        """Compose the current catalog images into a stored contact-sheet scene."""
+        image_ids = self.qpane.imageIDs()
+        if not image_ids:
+            self._set_status("Load images before composing a contact sheet.")
+            return
+        catalog = self.qpane.getCatalogSnapshot()
+        request = scene_composition.build_contact_sheet_request(
+            image_ids,
+            image_sizes={
+                image_id: catalog.catalog[image_id].image.size()
+                for image_id in image_ids
+            },
+            columns=min(3, max(1, len(image_ids))),
+            cell_width=320.0,
+            cell_height=240.0,
+            gap=16.0,
+        )
+        scene_composition.install_contact_sheet_overlay(self.qpane)
+        composition_id = self.qpane.composeScene(request)
+        self._set_status(f"Composed contact-sheet scene {composition_id}.")
+
     def _step_image(self, delta: int) -> None:
-        """Advance the current image using the QPane facade."""
-        ids = self.qpane.imageIDs()
-        if not ids:
+        """Advance the current composition using the QPane facade."""
+        composition_ids = self.qpane.compositionIDs()
+        if not composition_ids:
             self._set_status("Load an image first.")
             return
-        current_id = self.qpane.currentImageID() or ids[0]
+        current_id = self.qpane.currentCompositionID() or composition_ids[0]
         try:
-            current_index = ids.index(current_id)
+            current_index = composition_ids.index(current_id)
         except ValueError:
             current_index = 0
-        next_index = (current_index + delta) % len(ids)
-        next_id = ids[next_index]
+        next_index = (current_index + delta) % len(composition_ids)
+        next_id = composition_ids[next_index]
+        snapshot = self.qpane.getCompositionSnapshot()
+        next_entry = snapshot.compositions.get(next_id)
         settings = self.qpane.settings.as_dict()
-        if bool(settings.get("mask_prefetch_enabled", False)):
-            self.qpane.prefetchMaskOverlays(next_id, reason="step")
-        self.qpane.setCurrentImageID(next_id)
-        self._set_status(f"Showing image {next_index + 1} of {len(ids)}.")
+        if (
+            next_entry is not None
+            and next_entry.current_image_id is not None
+            and bool(settings.get("mask_prefetch_enabled", False))
+        ):
+            self.qpane.prefetchMaskOverlays(next_entry.current_image_id, reason="step")
+        self.qpane.openComposition(next_id)
+        self._set_status(
+            f"Showing composition {next_index + 1} of {len(composition_ids)}."
+        )
 
     def _save_active_mask_dialog(self) -> None:
         """Save the active mask via the QPane facade."""
@@ -863,7 +919,7 @@ class ExampleWindow(QMainWindow):
         self._load_batch_auto_select = False
         total = len(self.qpane.imageIDs())
         self._set_status(
-            f"Finished loading {count} images. Total: {total}. Use Left/Right to navigate."
+            f"Finished loading {count} images. Total: {total}. Use Left/Right to navigate compositions."
         )
 
     def _remove_current_image(self) -> None:
@@ -894,10 +950,11 @@ class ExampleWindow(QMainWindow):
         if not self._mask_tools_available():
             self._set_status("Mask tools disabled in this mode.")
             return None
-        if self.qpane.currentImage.isNull():
+        image = self.qpane.currentImage
+        if image is None or image.isNull():
             self._set_status("Load an image before creating masks.")
             return None
-        mask_id = self.qpane.createBlankMask(self.qpane.currentImage.size())
+        mask_id = self.qpane.createBlankMask(image.size())
         if mask_id is None:
             self._set_status("Unable to create a mask layer.")
             return None
@@ -932,7 +989,8 @@ class ExampleWindow(QMainWindow):
         if not self._mask_tools_available():
             self._set_status("Mask tools disabled in this mode.")
             return
-        if self.qpane.currentImage.isNull():
+        image = self.qpane.currentImage
+        if image is None or image.isNull():
             self._set_status("Load an image before importing masks.")
             return
         mask_path = Path(path)
@@ -948,6 +1006,12 @@ class ExampleWindow(QMainWindow):
         self.qpane.catalogChanged.connect(self._handle_catalog_event)
         self.qpane.catalogSelectionChanged.connect(
             self._handle_catalog_selection_change
+        )
+        self.qpane.compositionChanged.connect(
+            lambda _snapshot: self._handle_catalog_event(None)
+        )
+        self.qpane.compositionSelectionChanged.connect(
+            lambda _composition_id: self._refresh_tool_enables()
         )
         self.qpane.catalogChanged.connect(lambda _event: self._refresh_tool_enables())
         self.qpane.catalogSelectionChanged.connect(
@@ -968,6 +1032,7 @@ class ExampleWindow(QMainWindow):
             self.qpane.maskUndoStackChanged.connect(self._update_mask_stack_readout)
         self.qpane.diagnosticsOverlayToggled.connect(self._sync_overlay_toggle)
         self.qpane.diagnosticsDomainToggled.connect(self._sync_overlay_detail_toggle)
+        self.qpane.comparisonChanged.connect(self._handle_comparison_changed)
         self.qpane.samCheckpointStatusChanged.connect(
             self._handle_sam_checkpoint_status
         )
@@ -1685,6 +1750,16 @@ class ExampleWindow(QMainWindow):
         self.next_image_action = QAction("Next ▶", self)
         self.next_image_action.setShortcut(Qt.Key_Right)
         self.next_image_action.triggered.connect(lambda: self._step_image(1))
+        self.compare_next_action = QAction("Compare Next", self)
+        self.compare_next_action.triggered.connect(self._compare_with_next_image)
+        self.compose_contact_sheet_action = QAction("Compose Contact Sheet", self)
+        self.compose_contact_sheet_action.triggered.connect(
+            self._compose_contact_sheet_scene
+        )
+        self.compare_flip_action = QAction("Flip Compare", self)
+        self.compare_flip_action.triggered.connect(self._flip_compare_orientation)
+        self.compare_clear_action = QAction("Clear Compare", self)
+        self.compare_clear_action.triggered.connect(self._clear_compare_image)
         self.mode_pan_action = QAction("Pan/Zoom", self, checkable=True)
         self.mode_pan_action.triggered.connect(
             lambda: self._set_control_mode(QPane.CONTROL_MODE_PANZOOM)
@@ -1748,7 +1823,7 @@ class ExampleWindow(QMainWindow):
             self.cycle_mode_action.triggered.connect(self._cycle_control_mode)
         self.config_action = QAction("Config", self)
         self.config_action.triggered.connect(self._open_config_dialog)
-        self.catalog_panel_action = QAction("Catalog", self, checkable=True)
+        self.catalog_panel_action = QAction("Browser Panel", self, checkable=True)
         self.catalog_panel_action.setChecked(False)
         self.catalog_panel_action.toggled.connect(self._handle_catalog_toggled)
         self.quick_reference_action = QAction("Quick Reference", self)
@@ -1765,6 +1840,7 @@ class ExampleWindow(QMainWindow):
             (self.clear_action, True),
             (self.prev_image_action, True),
             (self.next_image_action, True),
+            (self.compose_contact_sheet_action, True),
         ]
         for action in mask_actions:
             self._gallery_actions.append((action, True))
@@ -1782,6 +1858,11 @@ class ExampleWindow(QMainWindow):
         view_menu = menu_bar.addMenu("&View")
         view_menu.addAction(self.catalog_panel_action)
         view_menu.addAction(self.quick_reference_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.compare_next_action)
+        view_menu.addAction(self.compose_contact_sheet_action)
+        view_menu.addAction(self.compare_flip_action)
+        view_menu.addAction(self.compare_clear_action)
         view_menu.addSeparator()
         diagnostics_menu = view_menu.addMenu("Diagnostics Overlay")
         self._build_diagnostics_menu(diagnostics_menu)
@@ -1840,6 +1921,14 @@ class ExampleWindow(QMainWindow):
             return added
 
         navigation_added = _add_group([self.prev_image_action, self.next_image_action])
+        compare_added = _add_group(
+            [
+                self.compare_next_action,
+                self.compose_contact_sheet_action,
+                self.compare_flip_action,
+                self.compare_clear_action,
+            ]
+        )
         mode_actions = [
             self.mode_cursor_action,
             self.mode_pan_action,
@@ -1853,7 +1942,7 @@ class ExampleWindow(QMainWindow):
         has_modes = any(action is not None for action in mode_actions) or bool(
             self.cycle_mode_action
         )
-        if navigation_added and has_modes:
+        if (navigation_added or compare_added) and has_modes:
             self._tools_toolbar.addSeparator()
         modes_added = _add_group(mode_actions)
         if self.cycle_mode_action is not None:
@@ -1962,7 +2051,7 @@ class ExampleWindow(QMainWindow):
         if self._catalog_toggle_sync:
             return
         self._apply_catalog_visibility(expanded, user_initiated=True)
-        message = "Catalog shown." if expanded else "Catalog hidden."
+        message = "Browser shown." if expanded else "Browser hidden."
         self._set_status(message)
 
     def _sync_catalog_toggle(self, visible: bool) -> None:
@@ -2021,6 +2110,10 @@ class ExampleWindow(QMainWindow):
         has_images = count > 0
         for action, base_enabled in self._gallery_actions:
             action.setEnabled(base_enabled and has_images)
+        has_comparison = self.qpane.comparisonState().enabled
+        self.compare_next_action.setEnabled(count > 1)
+        self.compare_flip_action.setEnabled(has_comparison)
+        self.compare_clear_action.setEnabled(has_comparison)
         if count < 2 and self._all_images_linked():
             self.qpane.setAllImagesLinked(False)
             self._set_status("Pan/zoom linking disabled.")
@@ -2131,6 +2224,10 @@ class ExampleWindow(QMainWindow):
         self._update_action_states(snapshot.image_count)
         self._handle_catalog_snapshot(snapshot)
         self._refresh_tool_enables()
+
+    def _handle_comparison_changed(self, _state) -> None:
+        """Refresh comparison actions after QPane comparison state changes."""
+        self._update_action_states(len(self.qpane.imageIDs()))
 
     def _handle_catalog_snapshot(self, snapshot: CatalogSnapshot) -> None:
         """Track mask presence and auto-show the catalog once masks exist."""

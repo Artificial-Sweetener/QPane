@@ -120,41 +120,53 @@ Testing focus (when implemented)
 - Core viewer installs cleanly with only PySide6.
 - Feature packages integrate without changing existing host code.
 
-## Introduce Layer Abstraction (Rendering + Data Model Refactor)
+## Generalize Scene Layers (Rendering + Public Mutation)
 
-Goal: unify QPane's rendering pipeline around a first-class Layer concept so images,
-masks, and future adjustment layers share one compositing model. The north star is
-supporting multiple image layers per catalog entry (e.g., A/B comparisons, blended
-exposures). This refactor must not change the public API; the only goals are
-improved performance and a unified rendering path across domains, while keeping
-viewer-only mode intact.
+Goal: build on QPane's existing scene/layer foundation so stored scene
+compositions can grow from catalog-backed image layouts into richer layered
+documents. The current scene model already handles catalog image layers, mask
+layers internally, opacity, clipping, hit testing, scene overlays, render-plan
+snapshots, and layer-scoped cache identity. The next step is making the parts
+hosts need to control explicit and polished without turning QPane into a full
+editor by default.
 
 Possible integration points
-- `qpane/catalog/`: evolve `CatalogEntry` and `ImageCatalog` to allow a stack of
-  layer descriptors per entry rather than a single image/path pairing.
-- `qpane/rendering/`: replace the "base image + overlays" split with a compositing
-  pipeline that renders ordered layers (image, mask, adjustment) in one pass.
-- `qpane/masks/`: adapt mask layers to conform to a shared Layer interface so
-  they can participate in ordering, blending, and visibility rules.
-- `qpane/swap/`: teach swap/prefetch logic to schedule layer assets (pyramids,
-  masks, previews) instead of only base images.
-- `qpane/core/` + `qpane/qpane.pyi`: expose public layer APIs (query, reorder,
-  visibility, blend settings) while keeping QPane as a thin facade.
+- `qpane/scene/`: add new layer kinds and source descriptors only when a real
+  rendering owner exists for them.
+- `qpane/composition/`: keep stored scene compositions as the authoritative home
+  for host-created layered views, including browser order and active selection.
+- `qpane/rendering/`: extend the existing scene render-plan path for additional
+  layer strategies, blend modes, and cache invalidation rules.
+- `qpane/masks/`: keep mask behavior owned by the mask domain while exposing only
+  the scene-layer data needed for rendering and host inspection.
+- `qpane/swap/`: continue scheduling layer-scoped assets so navigation, pyramid
+  work, tile work, masks, and future layer assets share the same cancellation and
+  prefetch discipline.
+- `qpane/core/` + `qpane/qpane.pyi`: expose public layer mutation APIs where hosts
+  need them, such as visibility, opacity, ordering, and blend settings.
 - Trinity updates: evolve `qpane.pyi`, `qpane.py`, `docs/`, and `examples/`
-  together for any new layer API surface with tutorialized demos.
+  together for any new public layer surface with tutorialized demos.
 
 Key behaviors to define
-- Layer ordering, visibility toggles, and blend/opacity rules across types.
-- Multi-image entries: how shared pan/zoom, hit testing, and caching behave.
-- Backward compatibility path: map the single-image model to a default base layer.
-- Layer metadata should be extensible enough to support future adjustment and
-  editing tool layers without reworking the core model.
+- Which layer mutations are public host controls and which remain owned by
+  feature domains.
+- Ordering, visibility, opacity, and blend semantics across catalog image layers,
+  mask layers, and future adjustment layers.
+- Whether multi-image layer stacks belong to catalog entries, stored scene
+  compositions, or a new document type.
+- How hit testing, overlays, comparison state, and active image selection behave
+  when several catalog images are visible in one scene.
+- Cache invalidation rules when layer parameters change without changing the
+  underlying catalog image.
 
 Testing focus (when implemented)
-- Correct visual ordering for stacked image + mask + adjustment layers.
-- Catalog navigation and swap stability with multi-layer entries.
-- Performance of tiling/pyramids when multiple image layers are active.
-- Viewer-only mode remains identical in behavior, performance, and API surface.
+- Correct visual ordering for mixed catalog image, mask, and future adjustment
+  layers.
+- Public layer mutations update rendering, overlays, hit testing, and composition
+  snapshots consistently.
+- Navigation and prefetch stay responsive when multiple layer assets are active.
+- Viewer-only mode remains identical when hosts use only generated default image
+  compositions.
 
 ## Modularize Core Infrastructure (Concurrency + Cache)
 

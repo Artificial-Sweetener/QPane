@@ -295,18 +295,21 @@ class MaskManager:
                 return mask_id
         return None
 
-    def cycle_mask_order(
-        self, image_id: uuid.UUID, forward: bool = True
-    ) -> uuid.UUID | None:
-        """Rotate mask ordering for ``image_id`` and return the new top mask id."""
+    def reorder_mask(
+        self, image_id: uuid.UUID, mask_id: uuid.UUID, target_index: int
+    ) -> bool:
+        """Move ``mask_id`` to ``target_index`` in ``image_id``'s render order."""
         mask_ids = self._image_mask_order.get(image_id)
-        if not mask_ids or len(mask_ids) < 2:
-            return None
-        if forward:
-            mask_ids.append(mask_ids.pop(0))
-        else:
-            mask_ids.insert(0, mask_ids.pop())
-        return mask_ids[-1]
+        if not mask_ids or mask_id not in mask_ids:
+            return False
+        if target_index < 0 or target_index >= len(mask_ids):
+            return False
+        current_index = mask_ids.index(mask_id)
+        if current_index == target_index:
+            return False
+        mask_ids.pop(current_index)
+        mask_ids.insert(target_index, mask_id)
+        return True
 
     @property
     def undo_limit(self) -> int:
@@ -343,15 +346,6 @@ class MaskManager:
         capture = getattr(self._undo_provider, "capture_snapshot", None)
         if capture is not None:
             capture(mask_id, layer.surface.snapshot_qimage())
-
-    def bring_mask_to_top(self, image_id: uuid.UUID, mask_id: uuid.UUID) -> bool:
-        """Move the specified mask to the top of ``image_id``'s stack."""
-        mask_ids = self._image_mask_order.get(image_id)
-        if not mask_ids or mask_id not in mask_ids:
-            return False
-        mask_ids.remove(mask_id)
-        mask_ids.append(mask_id)
-        return True
 
     def create_mask(self, image: QImage) -> uuid.UUID:
         """Create a blank mask sized to ``image`` and register it with history."""

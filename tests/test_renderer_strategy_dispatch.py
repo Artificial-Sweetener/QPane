@@ -24,7 +24,9 @@ from PySide6.QtCore import QPointF, QRect, QRectF, QSize
 from PySide6.QtGui import QImage, QRegion, Qt, QTransform
 
 from qpane import QPane
-from qpane.rendering import Renderer, RenderState, RenderStrategy
+from qpane.rendering import Renderer
+from qpane.scene.render_plan import RenderStrategy
+from tests.helpers.render_plan import make_render_plan
 
 
 class _StubQPane:
@@ -41,23 +43,14 @@ class _StubQPane:
         return self._size
 
 
-def _make_state(qpane_rect: QRect, strategy: RenderStrategy) -> RenderState:
+def _make_plan(qpane_rect: QRect, strategy: RenderStrategy):
     source_image = QImage(qpane_rect.size(), QImage.Format_ARGB32_Premultiplied)
     source_image.fill(Qt.white)
-    return RenderState(
+    return make_render_plan(
+        qpane_rect,
         source_image=source_image,
-        pyramid_scale=1.0,
         transform=QTransform(),
-        zoom=1.0,
         strategy=strategy,
-        render_hint_enabled=False,
-        debug_draw_tile_grid=False,
-        tiles_to_draw=[],
-        tile_size=64,
-        tile_overlap=0,
-        max_tile_cols=1,
-        max_tile_rows=1,
-        qpane_rect=qpane_rect,
         current_pan=QPointF(0.0, 0.0),
         physical_viewport_rect=QRectF(qpane_rect),
         visible_tile_range=(0, 0, 0, 0) if strategy is RenderStrategy.TILE else None,
@@ -81,26 +74,26 @@ def test_redraw_base_image_buffer_respects_strategy(
         qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
     )
     renderer._base_image_buffer.fill(Qt.transparent)
-    state = _make_state(qpane_rect, strategy=strategy)
+    plan = _make_plan(qpane_rect, strategy=strategy)
     dirty_region = QRegion(qpane_rect)
     direct_calls = []
     tile_calls = []
     monkeypatch.setattr(
         renderer,
         "_draw_direct_view",
-        lambda painter, render_state: direct_calls.append(render_state),
+        lambda painter, item: direct_calls.append(item),
     )
     monkeypatch.setattr(
         renderer,
         "_draw_tiled_view",
-        lambda painter, render_state: tile_calls.append(render_state),
+        lambda painter, plan, item: tile_calls.append((plan, item)),
     )
-    renderer._redraw_base_image_buffer(dirty_region, state)
+    renderer._redraw_base_image_buffer(dirty_region, plan)
     assert len(direct_calls) == expected_direct_calls
     assert len(tile_calls) == expected_tile_calls
 
 
-def test_calculateRenderState_prefers_direct_when_image_fits(qapp):
+def test_calculate_render_plan_prefers_direct_when_image_fits(qapp):
     qpane = QPane(features=())
     try:
         qpane.resize(256, 256)
@@ -120,15 +113,17 @@ def test_calculateRenderState_prefers_direct_when_image_fits(qapp):
         # If we want to test specific zoom behavior, we should set the zoom after loading.
         viewport = qpane.view().viewport
         viewport.setZoomFit()  # The original test called this anyway!
-        state = qpane.view().calculateRenderState()
+        plan = qpane.view().calculateRenderPlan()
     finally:
         qpane.deleteLater()
         qapp.processEvents()
-    assert state is not None
-    assert state.strategy is RenderStrategy.DIRECT
+    assert plan is not None
+    item = plan.base_raster_item
+    assert item is not None
+    assert item.strategy is RenderStrategy.DIRECT
 
 
-def test_calculateRenderState_switches_to_tile_for_large_zoom(qapp):
+def test_calculate_render_plan_switches_to_tile_for_large_zoom(qapp):
     qpane = QPane(features=())
     try:
         qpane.resize(128, 128)
@@ -140,9 +135,11 @@ def test_calculateRenderState_switches_to_tile_for_large_zoom(qapp):
         viewport = qpane.view().viewport
         viewport.setZoomFit()
         viewport.applyZoom(4.0)
-        state = qpane.view().calculateRenderState()
+        plan = qpane.view().calculateRenderPlan()
     finally:
         qpane.deleteLater()
         qapp.processEvents()
-    assert state is not None
-    assert state.strategy is RenderStrategy.TILE
+    assert plan is not None
+    item = plan.base_raster_item
+    assert item is not None
+    assert item.strategy is RenderStrategy.TILE

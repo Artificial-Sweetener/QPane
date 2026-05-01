@@ -16,6 +16,7 @@
 
 """Tests asserting specific behavioral contracts documented in the API reference."""
 
+import json
 import uuid
 import pytest
 from PySide6.QtGui import QImage, Qt
@@ -37,22 +38,20 @@ def test_config_behavior():
     """Assert Config object behavior: copy, as_dict, configure, validation."""
     # Test initialization and as_dict
     cfg = Config(placeholder={"source": "init"})
-    # PlaceholderSettings is returned as an object, not a dict
-    assert cfg.as_dict()["placeholder"].source == "init"
+    assert cfg.as_dict()["placeholder"]["source"] == "init"
+    json.dumps(cfg.as_dict())
     # Test copy
     cfg_copy = cfg.copy()
     assert cfg_copy is not cfg
     # Compare attributes since objects might not compare equal if __eq__ isn't defined or if deepcopy changes identity
-    assert (
-        cfg_copy.as_dict()["placeholder"].source == cfg.as_dict()["placeholder"].source
-    )
+    assert cfg_copy.as_dict()["placeholder"] == cfg.as_dict()["placeholder"]
     # Test configure with merge
     cfg.configure(placeholder={"scale_mode": "auto"})
-    assert cfg.as_dict()["placeholder"].source == "init"
-    assert cfg.as_dict()["placeholder"].scale_mode == "auto"
+    assert cfg.as_dict()["placeholder"]["source"] == "init"
+    assert cfg.as_dict()["placeholder"]["scale_mode"] == "auto"
     # Test configure with keyword overrides
     cfg.configure(placeholder={"source": "override"}, drag_out_enabled=False)
-    assert cfg.as_dict()["placeholder"].source == "override"
+    assert cfg.as_dict()["placeholder"]["source"] == "override"
     assert getattr(cfg, "drag_out_enabled") is False
     # Test unknown keys raise
     with pytest.raises(ValueError):
@@ -114,6 +113,7 @@ def test_navigation_behavior(qapp):
         # None should clear selection
         qpane.setCurrentImageID(None)
         assert qpane.currentImageID() is None
+        assert qpane.currentImage is None
     finally:
         _cleanup_qpane(qpane, qapp)
 

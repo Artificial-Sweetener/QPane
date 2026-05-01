@@ -51,7 +51,7 @@ def cursor(qpane):
     dpr = float(qpane.devicePixelRatioF()) or 1.0
     coords = None
     image = qpane.currentImage
-    if not image.isNull():
+    if image is not None and not image.isNull():
         hit = qpane.panelHitTest(qpane.mapFromGlobal(QCursor.pos()))
         if hit is not None and hit.inside_image:
             coords = (hit.clamped_point.x(), hit.clamped_point.y())

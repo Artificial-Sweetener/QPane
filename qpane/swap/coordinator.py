@@ -45,7 +45,12 @@ from ..core.config_features import SamConfigSlice, require_sam_config
 
 from ..features import FeatureInstallError
 
-from ..rendering import TileIdentifier, Viewport
+from ..rendering import Viewport
+from ..scene.identity import (
+    SceneLayerAssetKey,
+    SceneLayerTileKey,
+    default_catalog_asset_key,
+)
 from .contracts import (
     MaskManagerView,
     MaskPrefetchService,
@@ -116,9 +121,9 @@ class SwapCoordinator:
         self._navigation_history: deque[uuid.UUID] = deque(maxlen=16)
         self._pending_mask_prefetch_ids: set[uuid.UUID] = set()
         self._pending_predictor_ids: set[uuid.UUID] = set()
-        self._pending_pyramid_ids: set[uuid.UUID] = set()
-        self._pyramid_prefetch_recent: dict[uuid.UUID, float] = {}
-        self._pending_tile_prefetch_ids: set[TileIdentifier] = set()
+        self._pending_pyramid_ids: set[SceneLayerAssetKey] = set()
+        self._pyramid_prefetch_recent: dict[SceneLayerAssetKey, float] = {}
+        self._pending_tile_prefetch_ids: set[SceneLayerTileKey] = set()
         self._navigation_inflight_start_ns: int | None = None
         self._last_navigation_duration_ms: float | None = None
         self._current_image_id: uuid.UUID | None = None
@@ -200,11 +205,12 @@ class SwapCoordinator:
             reason="navigation",
             skip=skip_predictor_ids or None,
         )
+        prefetch_skip_assets = self._asset_keys_for_image_ids(skip_predictor_ids)
         self._cancel_pyramid_prefetches(
             reason="navigation",
-            skip=skip_predictor_ids,
+            skip=prefetch_skip_assets,
         )
-        self._cancel_tile_prefetches(reason="navigation", skip=skip_predictor_ids)
+        self._cancel_tile_prefetches(reason="navigation", skip=prefetch_skip_assets)
         fit_view = False if fit_view is None else bool(fit_view)
         self.display_current_image(fit_view=fit_view)
         self.prefetch_neighbors(image_id, candidates=neighbor_ids)
@@ -290,14 +296,16 @@ class SwapCoordinator:
                 else:
                     self._pending_predictor_ids.add(image_id)
             qpane.original_image = image
-            self._viewport.setContentSize(qpane.original_image.size())
+            self._viewport.setContentSize(image.size())
             if fit_view:
                 self._viewport.setZoomFit()
-            content_changed = self._catalog.updateCurrentEntry(
-                image=image, path=source_path
+            mutation = self._catalog.updateCurrentEntry(image=image, path=source_path)
+            cache_changed_ids = set(mutation.content_changed_ids) | set(
+                mutation.path_changed_ids
             )
-            if content_changed and image_id is not None:
-                self._tile_manager.remove_tiles_for_image_id(image_id)
+            for asset_key in mutation.cache_asset_keys_to_evict:
+                self._tile_manager.remove_tiles_for_source_asset(asset_key)
+            if image_id is not None and image_id in cache_changed_ids:
                 if self._sam_manager is not None:
                     remove_cache = getattr(self._sam_manager, "removeFromCache", None)
                     if callable(remove_cache):
@@ -448,14 +456,14 @@ class SwapCoordinator:
             return -1
         return value
 
-    def _on_tile_ready(self, identifier: TileIdentifier) -> None:
+    def _on_tile_ready(self, key: SceneLayerTileKey) -> None:
         """Drop completed tile prefetch identifiers from tracking."""
-        self._pending_tile_prefetch_ids.discard(identifier)
+        self._pending_tile_prefetch_ids.discard(key)
         self._mark_diagnostics_dirty()
 
-    def _on_pyramid_ready(self, image_id: uuid.UUID) -> None:
+    def _on_pyramid_ready(self, asset_key: SceneLayerAssetKey) -> None:
         """Stop tracking pyramid prefetches once they are ready."""
-        self._pending_pyramid_ids.discard(image_id)
+        self._pending_pyramid_ids.discard(asset_key)
         self._mark_diagnostics_dirty()
 
     def _cancel_pending_items(
@@ -555,41 +563,39 @@ class SwapCoordinator:
         self._mark_diagnostics_dirty()
 
     def _cancel_pyramid_prefetches(
-        self, *, reason: str, skip: Collection[uuid.UUID] | None = None
+        self, *, reason: str, skip: Collection[SceneLayerAssetKey] | None = None
     ) -> None:
         """Cancel tracked pyramid prefetches except those in ``skip``."""
         manager = self._pyramid_manager
-        skip_ids = set(skip or ())
+        skip_keys = set(skip or ())
         if not self._pending_pyramid_ids:
             return
         pending = set(self._pending_pyramid_ids)
-        cancel_ids = [image_id for image_id in pending if image_id not in skip_ids]
-        if cancel_ids:
+        cancel_keys = [key for key in pending if key not in skip_keys]
+        if cancel_keys:
             try:
-                manager.cancel_prefetch(cancel_ids, reason=reason)
+                manager.cancel_prefetch(cancel_keys, reason=reason)
             except Exception:
                 logger.exception(
                     "Pyramid prefetch cancellation failed (count=%s, reason=%s)",
-                    len(cancel_ids),
+                    len(cancel_keys),
                     reason,
                 )
-        self._pending_pyramid_ids = {
-            image_id for image_id in pending if image_id in skip_ids
-        }
+        self._pending_pyramid_ids = {key for key in pending if key in skip_keys}
         self._mark_diagnostics_dirty()
 
     def _cancel_tile_prefetches(
-        self, *, reason: str, skip: Collection[uuid.UUID] | None = None
+        self, *, reason: str, skip: Collection[SceneLayerAssetKey] | None = None
     ) -> None:
-        """Cancel tile prefetch jobs whose image IDs are not in ``skip``."""
+        """Cancel tile prefetch jobs whose asset keys are not in ``skip``."""
         manager = self._tile_manager
-        skip_ids = set(skip or ())
+        skip_keys = set(skip or ())
         if not self._pending_tile_prefetch_ids:
             return
         cancel_idents = [
             ident
             for ident in self._pending_tile_prefetch_ids
-            if ident.image_id not in skip_ids
+            if ident.asset_key not in skip_keys
         ]
         if cancel_idents:
             try:
@@ -605,7 +611,7 @@ class SwapCoordinator:
         self._pending_tile_prefetch_ids = {
             ident
             for ident in self._pending_tile_prefetch_ids
-            if ident.image_id in skip_ids
+            if ident.asset_key in skip_keys
         }
         self._mark_diagnostics_dirty()
 
@@ -660,6 +666,33 @@ class SwapCoordinator:
                 seen.add(candidate)
                 ordered.append(candidate)
         return ordered
+
+    def _asset_keys_for_image_ids(
+        self, image_ids: Collection[uuid.UUID]
+    ) -> set[SceneLayerAssetKey]:
+        """Return current default-scene asset keys for known catalog image IDs."""
+        asset_keys: set[SceneLayerAssetKey] = set()
+        for image_id in image_ids:
+            asset_key = self._asset_key_for_catalog_image(image_id)
+            if asset_key is not None:
+                asset_keys.add(asset_key)
+        return asset_keys
+
+    def _asset_key_for_catalog_image(
+        self, image_id: uuid.UUID
+    ) -> SceneLayerAssetKey | None:
+        """Return the current default-scene asset key for a catalog image."""
+        revision_getter = getattr(self._catalog, "getRevision", None)
+        if not callable(revision_getter):
+            return None
+        revision = revision_getter(image_id)
+        if revision is None:
+            return None
+        return default_catalog_asset_key(
+            image_id,
+            revision=max(0, int(revision)),
+            source_path=self._catalog.getPath(image_id),
+        )
 
     def _prefetch_neighbor_masks(self, candidates: Sequence[uuid.UUID]) -> None:
         """Submit mask prefetch jobs for likely navigation targets respecting depth limits."""
@@ -737,7 +770,10 @@ class SwapCoordinator:
         for neighbor_id in neighbor_ids:
             if neighbor_id == current_id:
                 continue
-            recent_ns = self._pyramid_prefetch_recent.get(neighbor_id)
+            asset_key = self._asset_key_for_catalog_image(neighbor_id)
+            if asset_key is None:
+                continue
+            recent_ns = self._pyramid_prefetch_recent.get(asset_key)
             now_sec = time.monotonic()
             if (
                 recent_ns is not None
@@ -749,7 +785,7 @@ class SwapCoordinator:
                     now_sec - recent_ns,
                 )
                 continue
-            if neighbor_id in self._pending_pyramid_ids:
+            if asset_key in self._pending_pyramid_ids:
                 continue
             image = self._catalog.getImage(neighbor_id)
             if image is None or image.isNull():
@@ -757,9 +793,8 @@ class SwapCoordinator:
             try:
                 scheduled = bool(
                     manager.prefetch_pyramid(
-                        neighbor_id,
+                        asset_key,
                         image,
-                        self._catalog.getPath(neighbor_id),
                         reason="neighbor",
                     )
                 )
@@ -770,8 +805,8 @@ class SwapCoordinator:
                 )
                 continue
             if scheduled:
-                self._pending_pyramid_ids.add(neighbor_id)
-                self._pyramid_prefetch_recent[neighbor_id] = now_sec
+                self._pending_pyramid_ids.add(asset_key)
+                self._pyramid_prefetch_recent[asset_key] = now_sec
                 # prune stale entries
                 stale_cutoff = now_sec - (PYRAMID_RESUBMIT_COOLDOWN_SEC * 4)
                 self._pyramid_prefetch_recent = {
@@ -818,7 +853,7 @@ class SwapCoordinator:
             pending = list(identifiers)
             if not pending:
                 continue
-            scheduled: Sequence[TileIdentifier] = ()
+            scheduled: Sequence[SceneLayerTileKey] = ()
             try:
                 scheduled = manager.prefetch_tiles(
                     pending, source_image, reason="neighbor"
@@ -843,9 +878,12 @@ class SwapCoordinator:
 
     def _prepare_tile_prefetch(
         self, *, image_id: uuid.UUID, image: QImage
-    ) -> tuple[QImage, list[TileIdentifier]] | None:
+    ) -> tuple[QImage, list[SceneLayerTileKey]] | None:
         """Return a source image and centered tile identifiers for neighbor prefetching."""
         manager = self._tile_manager
+        asset_key = self._asset_key_for_catalog_image(image_id)
+        if asset_key is None:
+            return None
         width = image.width()
         height = image.height()
         if width <= 0 or height <= 0:
@@ -855,7 +893,7 @@ class SwapCoordinator:
             return None
         zoom = self._viewport.zoom if self._viewport.zoom > 0 else 1.0
         target_width = width * zoom
-        source_image = self._catalog.getBestFitImage(image_id, target_width)
+        source_image = self._catalog.getBestFitImageForAsset(asset_key, target_width)
         if source_image is None or source_image.isNull():
             source_image = image
         if source_image.isNull():
@@ -879,7 +917,7 @@ class SwapCoordinator:
             (-1, 1),
             (1, -1),
         ]
-        identifiers: list[TileIdentifier] = []
+        identifiers: list[SceneLayerTileKey] = []
         for dr, dc in offsets:
             if len(identifiers) >= tile_budget:
                 break
@@ -887,9 +925,9 @@ class SwapCoordinator:
             col = center_col + dc
             if row < 0 or row >= rows or col < 0 or col >= cols:
                 continue
-            ident = TileIdentifier(
-                image_id=image_id,
-                source_path=self._catalog.getPath(image_id),
+            ident = SceneLayerTileKey(
+                asset_key=asset_key,
+                pyramid_asset_key=asset_key,
                 pyramid_scale=pyramid_scale,
                 row=row,
                 col=col,
@@ -898,9 +936,9 @@ class SwapCoordinator:
                 identifiers.append(ident)
         if not identifiers:
             identifiers.append(
-                TileIdentifier(
-                    image_id=image_id,
-                    source_path=self._catalog.getPath(image_id),
+                SceneLayerTileKey(
+                    asset_key=asset_key,
+                    pyramid_asset_key=asset_key,
                     pyramid_scale=pyramid_scale,
                     row=center_row,
                     col=center_col,

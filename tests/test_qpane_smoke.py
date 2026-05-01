@@ -29,8 +29,10 @@ from PySide6.QtGui import QImage, QTransform
 from qpane import Config, LinkedGroup, OverlayState, QPane
 from qpane.catalog import CatalogMutationEvent
 from qpane.features import FeatureInstallError
-from qpane.rendering import RenderState, RenderStrategy, Tile, ViewportZoomMode
-from qpane.rendering.tiles import TileIdentifier
+from qpane.rendering import Tile, ViewportZoomMode
+from qpane.scene.render_plan import RenderStrategy
+from qpane.scene.identity import SceneLayerTileKey, default_catalog_asset_key
+from tests.helpers.render_plan import make_render_plan, make_tile_key
 from tests.helpers.executor_stubs import StubExecutor
 from tests.helpers.mask_test_utils import drain_mask_jobs
 from tests.test_mask_workflows import (
@@ -159,15 +161,8 @@ def _assert_view_alignment(qpane: QPane) -> None:
 def _assert_view_handles_tile_ready(qpane: QPane, monkeypatch) -> None:
     """Verify tile-ready callbacks delegate to the swap layer."""
     view = qpane.view()
-    image_id = uuid.uuid4()
-    sentinel = TileIdentifier(
-        image_id=image_id,
-        source_path=None,
-        pyramid_scale=1.0,
-        row=0,
-        col=0,
-    )
-    calls: list[TileIdentifier] = []
+    sentinel = make_tile_key()
+    calls: list[SceneLayerTileKey] = []
     monkeypatch.setattr(view.swap_delegate, "handle_tile_ready", calls.append)
     view.handle_tile_ready(sentinel)
     assert calls == [sentinel]
@@ -176,7 +171,7 @@ def _assert_view_handles_tile_ready(qpane: QPane, monkeypatch) -> None:
 def _assert_view_handles_pyramid_ready(qpane: QPane, monkeypatch) -> None:
     """Verify pyramid-ready callbacks delegate to the swap layer."""
     view = qpane.view()
-    sentinel = uuid.uuid4()
+    sentinel = default_catalog_asset_key(uuid.uuid4(), revision=0, source_path=None)
     calls: list[uuid.UUID | None] = []
     monkeypatch.setattr(view.swap_delegate, "handle_pyramid_ready", calls.append)
     view.handle_pyramid_ready(sentinel)
@@ -359,23 +354,17 @@ def _assert_overlay_draw_invoked_during_paint(qpane: QPane, monkeypatch) -> None
     """Ensure overlay draw functions receive the presenter state during paint."""
     qpane.resize(20, 20)
     source_image = _solid_image(2, 2)
-    render_state = RenderState(
+    render_plan = make_render_plan(
+        QRect(0, 0, 20, 20),
         source_image=source_image,
-        pyramid_scale=1.0,
         transform=QTransform(),
         zoom=1.25,
         strategy=RenderStrategy.DIRECT,
-        render_hint_enabled=False,
-        debug_draw_tile_grid=False,
-        tiles_to_draw=[],
         tile_size=256,
-        tile_overlap=0,
         max_tile_cols=0,
         max_tile_rows=0,
-        qpane_rect=QRect(0, 0, 20, 20),
         current_pan=QPointF(0, 0),
         physical_viewport_rect=QRectF(0, 0, 20, 20),
-        visible_tile_range=None,
     )
 
     class DummyRenderer:
@@ -384,8 +373,8 @@ def _assert_overlay_draw_invoked_during_paint(qpane: QPane, monkeypatch) -> None
             self._image = QImage(2, 2, QImage.Format_ARGB32)
             self._image.fill(Qt.black)
 
-        def paint(self, state):
-            self.calls.append(state)
+        def paint(self, plan):
+            self.calls.append(plan)
 
         def get_base_buffer(self):
             return self._image
@@ -402,10 +391,10 @@ def _assert_overlay_draw_invoked_during_paint(qpane: QPane, monkeypatch) -> None
 
     presenter = qpane.view().presenter
     original_renderer = presenter.renderer
-    original_state_fn = presenter.calculateRenderState
+    original_plan_fn = presenter.calculateRenderPlan
     renderer = DummyRenderer()
     presenter.renderer = renderer
-    presenter.calculateRenderState = lambda **_: render_state
+    presenter.calculateRenderPlan = lambda **_: render_plan
     original_overlay = qpane._tools_manager.draw_overlay
     qpane._tools_manager.draw_overlay = lambda painter: None
     calls: list[OverlayState] = []
@@ -418,18 +407,23 @@ def _assert_overlay_draw_invoked_during_paint(qpane: QPane, monkeypatch) -> None
         qpane.paintEvent(None)
         assert len(calls) == 1
         overlay_state = calls[0]
-        assert overlay_state.zoom == render_state.zoom
-        assert overlay_state.qpane_rect == render_state.qpane_rect
-        assert overlay_state.source_image is render_state.source_image
-        assert overlay_state.transform == render_state.transform
-        assert overlay_state.current_pan == render_state.current_pan
+        base_item = render_plan.base_raster_item
+        assert base_item is not None
+        assert overlay_state.zoom == render_plan.zoom
+        assert overlay_state.qpane_rect == render_plan.qpane_rect
+        assert overlay_state.source_image.size() == base_item.source_image.size()
+        assert overlay_state.source_image.pixelColor(
+            0, 0
+        ) == base_item.source_image.pixelColor(0, 0)
+        assert overlay_state.transform == base_item.transform
+        assert overlay_state.current_pan == render_plan.current_pan
         assert (
-            overlay_state.physical_viewport_rect == render_state.physical_viewport_rect
+            overlay_state.physical_viewport_rect == render_plan.physical_viewport_rect
         )
     finally:
         qpane.unregisterOverlay("unit-test")
         presenter.renderer = original_renderer
-        presenter.calculateRenderState = original_state_fn
+        presenter.calculateRenderPlan = original_plan_fn
         qpane._tools_manager.draw_overlay = original_overlay
 
 
@@ -482,14 +476,8 @@ def _assert_apply_settings_clears_tile_cache(
     """Changing tile size should flush tile cache and worker metadata."""
     tile_manager = qpane.view().tile_manager
     image_id = uuid.uuid4()
-    identifier = TileIdentifier(
-        image_id,
-        tmp_path / "image.png",
-        1.0,
-        0,
-        0,
-    )
-    tile_manager._tile_cache[identifier] = Tile(identifier=identifier, image=QImage())
+    identifier = make_tile_key(image_id, tmp_path / "image.png", 1.0, 0, 0)
+    tile_manager._tile_cache[identifier] = Tile(key=identifier, image=QImage())
     tile_manager._cache_size_bytes = 128
     tile_manager._worker_state[identifier] = {"worker": None, "handle": None}
     new_tile_size = tile_manager.tile_size // 2
@@ -778,14 +766,14 @@ def _assert_qpane_paint_event_triggers_alignment(qpane: QPane, monkeypatch) -> N
     original_overlay_draw = qpane._tools_manager.draw_overlay
     qpane._tools_manager.draw_overlay = lambda painter: None
     presenter = qpane.view().presenter
-    original_state_fn = presenter.calculateRenderState
-    presenter.calculateRenderState = lambda **_: None
+    original_plan_fn = presenter.calculateRenderPlan
+    presenter.calculateRenderPlan = lambda **_: None
 
     class DummyRenderer:
         def __init__(self):
             self._image = _solid_image(8, 8)
 
-        def paint(self, state):
+        def paint(self, plan):
             return None
 
         def get_base_buffer(self):
@@ -807,7 +795,7 @@ def _assert_qpane_paint_event_triggers_alignment(qpane: QPane, monkeypatch) -> N
         assert calls == [False]
     finally:
         qpane._tools_manager.draw_overlay = original_overlay_draw
-        presenter.calculateRenderState = original_state_fn
+        presenter.calculateRenderPlan = original_plan_fn
         presenter.renderer = original_renderer
 
 

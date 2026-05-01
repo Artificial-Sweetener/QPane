@@ -14,17 +14,7 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FieldSpec catalog for the QPane example config dialog grouped by feature domain.
-
-Add a control by declaring a :class:`FieldSpec`, grouping it under a :class:`FieldGroupSpec`,
-and including it in the section builder. Feature-gate fields by setting ``feature_namespace``
-so mask/SAM-only controls hide when those extras are unavailable.
-
-Extension seams:
-- Group fields by domain (viewer basics, cache/prefetch, masks, SAM, diagnostics, concurrency).
-- Keep new fields aligned with the Config tree; wire them through ``config/dialog.py``.
-- Use ``feature_namespace`` to hide fields when features are inactive.
-"""
+"""Field specifications for the example configuration dialog."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -94,7 +84,7 @@ DIAGNOSTIC_DOMAIN_OPTIONS: tuple[tuple[str, str, str, str | None], ...] = (
     (
         DiagnosticsDomain.SWAP.value,
         "Swap",
-        "Show swap loader status, prefetch state, and render paths.",
+        "Show navigation, prefetch, and renderer queue diagnostics.",
         "diagnostics",
     ),
     (
@@ -195,7 +185,7 @@ VIEWER_CACHE_FIELDS: tuple[FieldSpec, ...] = (
         maximum=100,
         step=1,
         suffix=" %",
-        tooltip="Weight of the active budget allocated to mask overlays.",
+        tooltip="Weight of the active budget allocated to mask renders.",
         label="Mask Weight (%)",
         feature_namespace="mask",
     ),
@@ -241,7 +231,7 @@ VIEWER_CACHE_FIELDS: tuple[FieldSpec, ...] = (
         maximum=8192,
         step=64,
         suffix=" MB",
-        tooltip="Explicit mask overlay cache budget (-1 = auto via weights).",
+        tooltip="Explicit mask render cache budget (-1 = auto via weights).",
         label="Mask Override (MB)",
         special_value_text="Auto (weight)",
         feature_namespace="mask",
@@ -612,7 +602,7 @@ MASK_EDITING_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec(
         path="mask_prefetch_enabled",
         kind="checkbox",
-        tooltip="Prefetch mask overlays for upcoming images to reduce latency.",
+        tooltip="Prefetch mask renders for upcoming images to reduce latency.",
         label="Prefetch Masks",
         feature_namespace="mask",
     ),

@@ -20,12 +20,31 @@ import math
 from pathlib import Path
 import uuid
 
-from PySide6.QtCore import QPointF, QRectF
-from PySide6.QtGui import QImage, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize
+from PySide6.QtGui import QImage, QPixmap, Qt
 from PySide6.QtWidgets import QWidget
 
 from qpane.core import CacheSettings
-from qpane.rendering import RenderStrategy, RenderingPresenter, ViewportZoomMode
+from qpane.rendering import (
+    RenderingPresenter,
+    ViewportZoomMode,
+)
+from qpane.scene.identity import (
+    SceneLayerAssetKey,
+    SceneLayerTileKey,
+    base_image_layer_id,
+    default_catalog_asset_key,
+    default_scene_id,
+)
+from qpane.scene.model import LayerKind
+from qpane.scene.mask_adapter import MaskServiceSceneProvider
+from qpane.scene.registry import (
+    CatalogLayerSourceResolver,
+    LayerSourceResolverRegistry,
+    SceneProviderRegistry,
+)
+from qpane.scene.render_plan import RenderStrategy
+from qpane.scene.sources import MaskLayerSource
 
 
 def _cleanup_qpane(widget: QWidget, qapp) -> None:
@@ -89,7 +108,10 @@ class StubQPane(QWidget):
         self._dpr = dpr
         self._view = StubView()
         self.original_image = QImage()
-        self.currentImagePath: Path | None = None
+        self.currentImagePath: Path | None = Path("stub.png")
+        self.mask_service = None
+        self._scene_providers = SceneProviderRegistry()
+        self._source_resolvers = LayerSourceResolverRegistry()
         self._current_image_id = uuid.uuid4()
         self._is_blank = True
         self.resize(*size)
@@ -119,13 +141,27 @@ class StubQPane(QWidget):
     def currentImageID(self):  # pragma: no cover - stub for presenter lookup
         return self._current_image_id
 
+    def sceneProviderRegistry(self) -> SceneProviderRegistry:
+        """Return the private scene-provider registry used by the presenter."""
+        return self._scene_providers
+
+    def layerSourceResolverRegistry(self) -> LayerSourceResolverRegistry:
+        """Return the private source resolver registry used by the presenter."""
+        return self._source_resolvers
+
 
 class StubCatalog:
     """Simplified catalog returning a preloaded QImage."""
 
-    def __init__(self, image: QImage) -> None:
+    def __init__(
+        self, image: QImage, *, image_id: uuid.UUID, path: Path | None
+    ) -> None:
         self._base_image = image
+        self._current_image_id = image_id
+        self._current_path = path
         self._resolver = None
+        self.revision = 0
+        self.best_fit_calls: list[tuple[SceneLayerAssetKey | None, float]] = []
 
     @property
     def base_image(self) -> QImage:
@@ -136,14 +172,52 @@ class StubCatalog:
         """Replace the stored image backing presenter lookups."""
         self._base_image = image
 
+    def set_current(
+        self,
+        *,
+        image: QImage,
+        image_id: uuid.UUID,
+        path: Path | None,
+    ) -> None:
+        """Replace the current catalog content."""
+        self._base_image = image
+        self._current_image_id = image_id
+        self._current_path = path
+
+    def set_path(self, path: Path | None) -> None:
+        """Replace the current source path."""
+        self._current_path = path
+
     def set_best_fit_resolver(self, resolver) -> None:
-        """Inject a callable that mirrors ImageCatalog.getBestFitImage."""
+        """Inject a callable that mirrors ImageCatalog.getBestFitImageForAsset."""
         self._resolver = resolver
 
-    def getBestFitImage(self, image_id, width):  # pragma: no cover - simple passthrough
+    def getBestFitImageForAsset(self, asset_key, width):  # pragma: no cover
+        self.best_fit_calls.append((asset_key, width))
         if self._resolver is not None:
-            return self._resolver(image_id, width)
+            return self._resolver(asset_key, width)
         return self._base_image
+
+    def getRevision(self, image_id):  # pragma: no cover - simple passthrough
+        return self.revision
+
+    def defaultAssetKeyForImage(
+        self, image_id
+    ):  # pragma: no cover - simple passthrough
+        return default_catalog_asset_key(
+            image_id,
+            revision=self.revision,
+            source_path=self._current_path,
+        )
+
+    def getCurrentId(self):  # pragma: no cover - simple passthrough
+        return self._current_image_id
+
+    def getCurrentImage(self):  # pragma: no cover - simple passthrough
+        return self._base_image
+
+    def getCurrentPath(self):  # pragma: no cover - simple passthrough
+        return self._current_path
 
 
 class _NullHandle:
@@ -174,10 +248,16 @@ class PresenterHarness:
         self.settings = StubSettings()
         self.qpane = StubQPane(settings=self.settings, size=qpane_size, dpr=dpr)
         base_image = _make_image(image_size[0], image_size[1], color)
-        self.catalog = StubCatalog(base_image)
+        self.catalog = StubCatalog(
+            base_image,
+            image_id=self.qpane._current_image_id,
+            path=self.qpane.currentImagePath,
+        )
+        self.qpane.layerSourceResolverRegistry().register(
+            CatalogLayerSourceResolver(self.catalog)
+        )
         self.executor = NoopExecutor()
         self.qpane.original_image = base_image
-        self.qpane.currentImagePath = Path("stub.png")
         self.presenter = RenderingPresenter(
             qpane=self.qpane,
             catalog=self.catalog,
@@ -196,7 +276,9 @@ class PresenterHarness:
         image_id: uuid.UUID | None = None,
     ) -> None:
         """Update the original image and catalog backing data."""
-        self.catalog.set_base_image(image)
+        next_id = image_id if image_id is not None else self.qpane._current_image_id
+        next_path = path if path is not None else self.qpane.currentImagePath
+        self.catalog.set_current(image=image, image_id=next_id, path=next_path)
         self.qpane.original_image = image
         if path is not None:
             self.qpane.currentImagePath = path
@@ -207,6 +289,11 @@ class PresenterHarness:
     def set_catalog_resolver(self, resolver) -> None:
         """Proxy helper for custom best-fit lookups."""
         self.catalog.set_best_fit_resolver(resolver)
+
+    def set_path(self, path: Path | None) -> None:
+        """Update the current catalog path."""
+        self.qpane.currentImagePath = path
+        self.catalog.set_path(path)
 
     def resize_qpane(self, width: int, height: int) -> None:
         """Resize the qpane widget and trigger viewport updates."""
@@ -229,7 +316,7 @@ class StubTileManager:
         rows = max(1, math.ceil(height / self.tile_size))
         return cols, rows
 
-    def get_tile(self, identifier, source_image) -> QImage:
+    def get_tile(self, identifier: SceneLayerTileKey, source_image) -> QImage:
         tile = _make_image(self.tile_size, self.tile_size, Qt.black)
         self.requested.append(identifier)
         return tile
@@ -238,16 +325,425 @@ class StubTileManager:
         self.cancelled = frozenset(visible_ids)
 
 
-def test_presenter_calculateRenderState_blank_returns_none(qapp):
+class StubMaskLayer:
+    """Small mask layer stand-in for presenter planning tests."""
+
+    def __init__(self, image: QImage, *, opacity: float) -> None:
+        self.mask_image = image
+        self.opacity = opacity
+
+
+class StubMaskManager:
+    """Expose mask order and layer lookup for scene adapter tests."""
+
+    def __init__(self, layers: dict[uuid.UUID, StubMaskLayer]) -> None:
+        self._layers = layers
+
+    def get_mask_ids_for_image(self, _image_id: uuid.UUID) -> list[uuid.UUID]:
+        """Return masks in visual order."""
+        return list(self._layers)
+
+    def get_layer(self, mask_id: uuid.UUID) -> StubMaskLayer | None:
+        """Return a configured mask layer."""
+        return self._layers.get(mask_id)
+
+
+class StubMaskController:
+    """Expose stable render revisions for presenter tests."""
+
+    def __init__(self, revisions: dict[uuid.UUID, int]) -> None:
+        self._revisions = revisions
+
+    def maskRenderRevision(self, mask_id: uuid.UUID) -> int:
+        """Return the configured render revision for ``mask_id``."""
+        return self._revisions[mask_id]
+
+
+def _old_qpane_visible_tile_range(
+    *,
+    source_size: QSize,
+    physical_viewport_rect: QRectF,
+    zoom: float,
+    pan: QPointF,
+    pyramid_scale: float,
+    tile_size: int,
+    tile_overlap: int,
+) -> tuple[int, int, int, int]:
+    """Return the old direct viewport-to-source visible tile range."""
+    effective_zoom = zoom / pyramid_scale
+    viewport_center = QPointF(physical_viewport_rect.center())
+    source_center = QPointF(source_size.width() / 2.0, source_size.height() / 2.0)
+    top_left = (
+        physical_viewport_rect.topLeft() - viewport_center - pan
+    ) / effective_zoom + source_center
+    bottom_right = (
+        physical_viewport_rect.bottomRight() - viewport_center - pan
+    ) / effective_zoom + source_center
+    source_rect = (
+        QRectF(top_left, bottom_right)
+        .normalized()
+        .intersected(
+            QRectF(0.0, 0.0, float(source_size.width()), float(source_size.height()))
+        )
+    )
+    if source_rect.isEmpty():
+        return 0, -1, 0, -1
+    stride = tile_size - tile_overlap
+    max_cols = max(1, math.ceil(source_size.width() / tile_size))
+    max_rows = max(1, math.ceil(source_size.height() / tile_size))
+    start_col = max(0, int(source_rect.left() / stride) - 1)
+    start_row = max(0, int(source_rect.top() / stride) - 1)
+    end_col = min(max_cols - 1, int(source_rect.right() / stride) + 1)
+    end_row = min(max_rows - 1, int(source_rect.bottom() / stride) + 1)
+    if start_col > end_col or start_row > end_row:
+        return 0, -1, 0, -1
+    return start_row, end_row, start_col, end_col
+
+
+class StubMaskService:
+    """Provide mask manager/controller and colorized pixmaps."""
+
+    def __init__(
+        self,
+        manager: StubMaskManager,
+        controller: StubMaskController,
+    ) -> None:
+        self.manager = manager
+        self.controller = controller
+        self.calls: list[tuple[uuid.UUID, float | None]] = []
+
+    def getColorizedMaskById(
+        self, mask_id: uuid.UUID, *, scale: float | None = None
+    ) -> QPixmap:
+        """Return a pixmap representing the requested mask render."""
+        self.calls.append((mask_id, scale))
+        source = self.manager.get_layer(mask_id)
+        assert source is not None
+        size = source.mask_image.size()
+        if scale is not None:
+            size = size * scale
+        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.magenta)
+        return QPixmap.fromImage(image)
+
+
+def test_presenter_calculate_render_plan_blank_returns_none(qapp):
     harness = PresenterHarness(qpane_size=(64, 64), image_size=(32, 32))
     try:
-        state = harness.presenter.calculateRenderState(is_blank=True)
-        assert state is None
+        plan = harness.presenter.calculateRenderPlan(is_blank=True)
+        assert plan is None
     finally:
         _cleanup_qpane(harness.qpane, qapp)
 
 
-def test_presenter_calculateRenderState_enters_tile_mode_when_zoomed(qapp):
+def test_presenter_render_plan_uses_best_fit_source_and_transform(qapp):
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(400, 200),
+        color=Qt.red,
+    )
+    try:
+        source_image = _make_image(200, 100, Qt.green)
+        image_id = uuid.uuid4()
+        harness.set_image(
+            harness.qpane.original_image,
+            path=Path("best-fit.png"),
+            image_id=image_id,
+        )
+        harness.viewport.zoom = 0.5
+        harness.viewport.pan = QPointF(12.0, -8.0)
+
+        expected_key = default_catalog_asset_key(
+            image_id,
+            revision=0,
+            source_path=Path("best-fit.png"),
+        )
+
+        def best_fit_resolver(requested_key, target_width):
+            assert requested_key == expected_key
+            assert math.isclose(target_width, 200.0)
+            return source_image
+
+        harness.set_catalog_resolver(best_fit_resolver)
+        plan = harness.presenter.calculateRenderPlan(is_blank=False)
+        assert plan is not None
+        item = plan.base_raster_item
+        assert item is not None
+        assert harness.catalog.best_fit_calls == [(expected_key, 200.0)]
+        assert item.source_image.size() == source_image.size()
+        assert item.source_image.pixelColor(0, 0) == source_image.pixelColor(0, 0)
+        assert math.isclose(item.pyramid_scale, 0.5)
+        assert item.strategy == RenderStrategy.DIRECT
+        assert plan.current_pan == QPointF(12.0, -8.0)
+        assert plan.physical_viewport_rect == QRectF(0, 0, 300, 200)
+        mapped_center = item.transform.map(QPointF(100, 50))
+        assert math.isclose(mapped_center.x(), 162.0)
+        assert math.isclose(mapped_center.y(), 92.0)
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_render_plan_carries_default_scene_metadata(qapp):
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(400, 200),
+        color=Qt.red,
+    )
+    try:
+        source_image = _make_image(200, 100, Qt.green)
+        image_id = uuid.uuid4()
+        image_path = Path("scene-plan.png")
+        harness.catalog.revision = 4
+        harness.set_image(
+            harness.qpane.original_image,
+            path=image_path,
+            image_id=image_id,
+        )
+        harness.viewport.zoom = 0.5
+        harness.viewport.pan = QPointF(12.0, -8.0)
+        harness.set_catalog_resolver(lambda _asset_key, _target_width: source_image)
+
+        plan = harness.presenter.calculateRenderPlan(is_blank=False)
+
+        assert plan is not None
+        assert plan.scene_id == default_scene_id(image_id)
+        assert plan.scene_bounds.width == 400.0
+        assert plan.scene_bounds.height == 200.0
+        assert plan.content_bounds == plan.scene_bounds
+        assert math.isclose(plan.zoom, 0.5)
+        assert plan.current_pan == QPointF(12.0, -8.0)
+        assert plan.qpane_rect == harness.qpane.rect()
+        assert plan.physical_viewport_rect == QRectF(0, 0, 300, 200)
+        assert len(plan.render_items) == 1
+        assert len(plan.hit_test_items) == 1
+        raster_item = plan.base_raster_item
+        assert raster_item is plan.render_items[0]
+        assert raster_item.source_image.size() == source_image.size()
+        assert raster_item.source_image.pixelColor(0, 0) == source_image.pixelColor(
+            0, 0
+        )
+        assert math.isclose(raster_item.pyramid_scale, 0.5)
+        assert raster_item.strategy == RenderStrategy.DIRECT
+        assert raster_item.render_hint_enabled is True
+        assert raster_item.debug_draw_tile_grid is False
+        assert raster_item.tiles_to_draw == ()
+        assert raster_item.tile_size == harness.presenter.tile_manager.tile_size
+        assert raster_item.tile_overlap == harness.presenter.tile_manager.tile_overlap
+        assert raster_item.max_tile_cols == 0
+        assert raster_item.max_tile_rows == 0
+        assert raster_item.visible_tile_range is None
+        assert raster_item.descriptor.layer_id == base_image_layer_id(image_id)
+        assert raster_item.descriptor.source_revision == 4
+        assert raster_item.asset_key.scene_id == default_scene_id(image_id)
+        assert raster_item.asset_key.layer_id == base_image_layer_id(image_id)
+        assert raster_item.asset_key.source_id == image_id
+        assert raster_item.asset_key.source_kind == "catalog-image"
+        assert raster_item.asset_key.source_revision == 4
+        assert raster_item.asset_key.source_path == image_path
+        assert raster_item.pyramid_asset_key == raster_item.asset_key
+        mapped_center = raster_item.transform.map(QPointF(100, 50))
+        assert math.isclose(mapped_center.x(), 162.0)
+        assert math.isclose(mapped_center.y(), 92.0)
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_render_plan_carries_mask_scene_layers(qapp):
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(400, 200),
+        color=Qt.red,
+    )
+    try:
+        source_image = _make_image(200, 100, Qt.green)
+        harness.viewport.zoom = 0.5
+        harness.set_catalog_resolver(lambda _asset_key, _target_width: source_image)
+        bottom_id = uuid.uuid4()
+        top_id = uuid.uuid4()
+        mask_image = QImage(400, 200, QImage.Format_Grayscale8)
+        mask_image.fill(255)
+        manager = StubMaskManager(
+            {
+                bottom_id: StubMaskLayer(mask_image, opacity=0.25),
+                top_id: StubMaskLayer(mask_image, opacity=0.75),
+            }
+        )
+        controller = StubMaskController({bottom_id: 4, top_id: 9})
+        service = StubMaskService(manager, controller)
+        harness.qpane.mask_service = service
+        harness.qpane.sceneProviderRegistry().register_contribution(
+            MaskServiceSceneProvider(service)
+        )
+
+        plan = harness.presenter.calculateRenderPlan(is_blank=False)
+
+        assert plan is not None
+        assert len(plan.render_items) == 3
+        base_item, bottom_item, top_item = plan.render_items
+        assert base_item.descriptor.kind == LayerKind.IMAGE
+        assert bottom_item.descriptor.kind == LayerKind.MASK
+        assert top_item.descriptor.kind == LayerKind.MASK
+        assert isinstance(bottom_item.descriptor.source, MaskLayerSource)
+        assert isinstance(top_item.descriptor.source, MaskLayerSource)
+        assert bottom_item.descriptor.source.mask_id == bottom_id
+        assert top_item.descriptor.source.mask_id == top_id
+        assert bottom_item.descriptor.source_revision == 4
+        assert top_item.descriptor.source_revision == 9
+        assert math.isclose(bottom_item.descriptor.opacity, 0.25)
+        assert math.isclose(top_item.descriptor.opacity, 0.75)
+        assert bottom_item.transform == base_item.transform
+        assert top_item.transform == base_item.transform
+        assert service.calls == [(bottom_id, 0.5), (top_id, 0.5)]
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_render_plan_uses_catalog_image_when_best_fit_missing(qapp):
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(128, 96),
+        color=Qt.blue,
+    )
+    try:
+        catalog_image = harness.catalog.base_image
+        harness.qpane.original_image = QImage()
+        harness.set_catalog_resolver(lambda _asset_key, _target_width: QImage())
+        plan = harness.presenter.calculateRenderPlan(is_blank=False)
+        assert plan is not None
+        item = plan.base_raster_item
+        assert item is not None
+        assert item.source_image.size() == catalog_image.size()
+        assert math.isclose(item.pyramid_scale, 1.0)
+        assert item.strategy == RenderStrategy.DIRECT
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_render_plan_ignores_stale_widget_mirror(qapp):
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(128, 96),
+        color=Qt.blue,
+    )
+    try:
+        stale_image = _make_image(8, 8, Qt.red)
+        harness.qpane.original_image = stale_image
+        plan = harness.presenter.calculateRenderPlan(is_blank=False)
+        assert plan is not None
+        item = plan.base_raster_item
+        assert item is not None
+        assert item.source_image.size() == harness.catalog.base_image.size()
+        assert (
+            plan.content_snapshot.base_image_size == harness.catalog.base_image.size()
+        )
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_current_content_snapshot_reuses_cached_resolution(qapp, monkeypatch):
+    """Repeated content geometry lookups should not resolve the scene again."""
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(128, 96),
+        color=Qt.blue,
+    )
+    try:
+        presenter = harness.presenter
+        original = presenter._resolve_active_scene_content
+        calls = []
+
+        def resolve_once():
+            calls.append("resolve")
+            return original()
+
+        monkeypatch.setattr(presenter, "_resolve_active_scene_content", resolve_once)
+
+        first = presenter.current_content_snapshot()
+        second = presenter.current_content_snapshot()
+
+        assert first is second
+        assert calls == ["resolve"]
+
+        harness.catalog.revision += 1
+        third = presenter.current_content_snapshot()
+
+        assert third is not None
+        assert len(calls) == 2
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_calculate_render_plan_reuses_cached_active_content(qapp, monkeypatch):
+    """Repeated paint planning should reuse active content while inputs are stable."""
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(128, 96),
+        color=Qt.blue,
+    )
+    try:
+        presenter = harness.presenter
+        original = presenter._resolve_active_scene_content
+        calls = []
+
+        def resolve_once():
+            calls.append("resolve")
+            return original()
+
+        monkeypatch.setattr(presenter, "_resolve_active_scene_content", resolve_once)
+
+        first = presenter.calculateRenderPlan(is_blank=False)
+        second = presenter.calculateRenderPlan(is_blank=False)
+
+        assert first is not None
+        assert second is not None
+        assert first.content_snapshot == second.content_snapshot
+        assert calls == ["resolve"]
+
+        harness.catalog.revision += 1
+        third = presenter.calculateRenderPlan(is_blank=False)
+
+        assert third is not None
+        assert len(calls) == 2
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_calculate_render_plan_reuses_cached_hit_test_projection(qapp, monkeypatch):
+    """Repeated paint planning should not rebuild stable hit-test metadata."""
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(128, 96),
+        color=Qt.blue,
+    )
+    try:
+        presenter = harness.presenter
+        original = presenter._hit_test_items_for_scene
+        calls = []
+
+        def project_once(scene):
+            calls.append("project")
+            return original(scene)
+
+        monkeypatch.setattr(presenter, "_hit_test_items_for_scene", project_once)
+
+        first = presenter.calculateRenderPlan(is_blank=False)
+        second = presenter.calculateRenderPlan(is_blank=False)
+
+        assert first is not None
+        assert second is not None
+        assert first.hit_test_items is second.hit_test_items
+        assert calls == ["project"]
+
+        harness.catalog.revision += 1
+        third = presenter.calculateRenderPlan(is_blank=False)
+
+        assert third is not None
+        assert len(calls) == 2
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_calculate_render_plan_enters_tile_mode_when_zoomed(qapp):
     harness = PresenterHarness(
         qpane_size=(256, 256),
         image_size=(2048, 2048),
@@ -258,13 +754,103 @@ def test_presenter_calculateRenderState_enters_tile_mode_when_zoomed(qapp):
         presenter = harness.presenter
         presenter.tile_manager = stub_manager
         harness.viewport.zoom = 4.0
-        harness.qpane.currentImagePath = Path("tile.png")
-        state = presenter.calculateRenderState(is_blank=False)
-        assert state is not None
-        assert state.strategy == RenderStrategy.TILE
+        harness.set_path(Path("tile.png"))
+        plan = presenter.calculateRenderPlan(is_blank=False)
+        assert plan is not None
+        item = plan.base_raster_item
+        assert item is not None
+        assert item.strategy == RenderStrategy.TILE
         assert stub_manager.requested
-        assert len(state.tiles_to_draw) == len(stub_manager.requested)
+        assert len(item.tiles_to_draw) == len(stub_manager.requested)
         assert stub_manager.cancelled is not None
+        assert item.visible_tile_range is not None
+        for identifier, tile_data in zip(stub_manager.requested, item.tiles_to_draw):
+            assert isinstance(identifier, SceneLayerTileKey)
+            assert identifier.asset_key.source_id == harness.qpane.currentImageID()
+            assert identifier.asset_key.source_path == Path("tile.png")
+            assert identifier.pyramid_asset_key == identifier.asset_key
+            assert math.isclose(identifier.pyramid_scale, item.pyramid_scale)
+            expected_pos = presenter.get_tile_draw_position(identifier)
+            assert tile_data.draw_pos == expected_pos
+        assert stub_manager.cancelled == frozenset(stub_manager.requested)
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_base_tile_range_matches_old_viewport_math(qapp):
+    harness = PresenterHarness(
+        qpane_size=(320, 240),
+        image_size=(2048, 1536),
+        color=Qt.blue,
+    )
+    try:
+        stub_manager = StubTileManager(tile_size=256, tile_overlap=16)
+        presenter = harness.presenter
+        presenter.tile_manager = stub_manager
+        harness.viewport.zoom = 4.0
+        harness.viewport.pan = QPointF(96.0, -48.0)
+        harness.set_path(Path("old-math.png"))
+
+        plan = presenter.calculateRenderPlan(is_blank=False)
+
+        assert plan is not None
+        item = plan.base_raster_item
+        assert item is not None
+        assert item.strategy == RenderStrategy.TILE
+        assert item.visible_tile_range == _old_qpane_visible_tile_range(
+            source_size=item.source_image.size(),
+            physical_viewport_rect=plan.physical_viewport_rect,
+            zoom=plan.zoom,
+            pan=plan.current_pan,
+            pyramid_scale=item.pyramid_scale,
+            tile_size=stub_manager.tile_size,
+            tile_overlap=stub_manager.tile_overlap,
+        )
+        assert stub_manager.cancelled == frozenset(stub_manager.requested)
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_scene_render_plan_carries_tile_metadata(qapp):
+    harness = PresenterHarness(
+        qpane_size=(256, 256),
+        image_size=(2048, 2048),
+        color=Qt.blue,
+    )
+    try:
+        stub_manager = StubTileManager(tile_size=256, tile_overlap=0)
+        presenter = harness.presenter
+        presenter.tile_manager = stub_manager
+        harness.viewport.zoom = 4.0
+        harness.set_path(Path("tile-scene.png"))
+        plan = presenter.calculateRenderPlan(is_blank=False)
+        assert plan is not None
+        raster_item = plan.base_raster_item
+        assert raster_item is not None
+        assert raster_item.strategy == RenderStrategy.TILE
+        assert stub_manager.requested
+        assert len(raster_item.tiles_to_draw) == len(stub_manager.requested)
+        assert raster_item.visible_tile_range is not None
+        assert stub_manager.cancelled == frozenset(stub_manager.requested)
+        for identifier, tile_data in zip(
+            stub_manager.requested,
+            raster_item.tiles_to_draw,
+        ):
+            assert isinstance(identifier, SceneLayerTileKey)
+            assert identifier.asset_key.source_id == harness.qpane.currentImageID()
+            assert identifier.asset_key.source_path == Path("tile-scene.png")
+            assert identifier.pyramid_asset_key == identifier.asset_key
+            assert math.isclose(identifier.pyramid_scale, raster_item.pyramid_scale)
+            assert tile_data.draw_pos == presenter.get_tile_draw_position(identifier)
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_presenter_scene_render_plan_blank_returns_none(qapp):
+    harness = PresenterHarness(qpane_size=(64, 64), image_size=(32, 32))
+    try:
+        plan = harness.presenter.calculateRenderPlan(is_blank=True)
+        assert plan is None
     finally:
         _cleanup_qpane(harness.qpane, qapp)
 
@@ -311,7 +897,7 @@ def test_presenter_paint_reallocates_when_buffer_size_stale(monkeypatch, qapp):
         color=Qt.yellow,
     )
     try:
-        harness.qpane.currentImagePath = Path("stale.png")
+        harness.set_path(Path("stale.png"))
         presenter = harness.presenter
 
         class BufferGuardRenderer:
@@ -367,7 +953,7 @@ def test_presenter_paint_skips_allocation_when_buffer_size_matches(monkeypatch, 
         color=Qt.cyan,
     )
     try:
-        harness.qpane.currentImagePath = Path("fresh.png")
+        harness.set_path(Path("fresh.png"))
         presenter = harness.presenter
         target_size = presenter._qpane_physical_size()
 
@@ -438,7 +1024,7 @@ def test_presenter_paint_restores_transform_before_tool_overlay(monkeypatch, qap
         monkeypatch.setattr(presenter, "renderer", stub_renderer)
         monkeypatch.setattr(
             presenter,
-            "calculateRenderState",
+            "calculateRenderPlan",
             lambda **_: object(),
         )
         observed_transforms = []
@@ -478,12 +1064,16 @@ def test_presenter_strategy_threshold_uses_physical_viewport(monkeypatch, qapp):
                 physical_width / image_width, physical_height / image_height
             )
             harness.viewport.zoom = threshold_zoom * 0.95
-            state = presenter.calculateRenderState(is_blank=False)
-            assert state is not None
-            assert state.strategy == RenderStrategy.DIRECT
+            plan = presenter.calculateRenderPlan(is_blank=False)
+            assert plan is not None
+            item = plan.base_raster_item
+            assert item is not None
+            assert item.strategy == RenderStrategy.DIRECT
             harness.viewport.zoom = threshold_zoom * 1.05
-            state = presenter.calculateRenderState(is_blank=False)
-            assert state is not None
-            assert state.strategy == RenderStrategy.TILE
+            plan = presenter.calculateRenderPlan(is_blank=False)
+            assert plan is not None
+            item = plan.base_raster_item
+            assert item is not None
+            assert item.strategy == RenderStrategy.TILE
     finally:
         _cleanup_qpane(harness.qpane, qapp)

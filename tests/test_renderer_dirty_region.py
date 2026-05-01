@@ -17,24 +17,27 @@
 from __future__ import annotations
 
 import types
-from dataclasses import replace
-
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize
 from PySide6.QtGui import QImage, QRegion, Qt, QTransform
 
-from qpane.rendering import Renderer, RenderState, RenderStrategy
+from qpane.rendering import Renderer
+from qpane.scene.render_plan import RenderStrategy
+from tests.helpers.render_plan import make_render_plan
 
 
 class _DummyRendererHost:
     def __init__(self, qpane_rect: QRect) -> None:
-        base_state = _make_render_state(qpane_rect)
+        base_plan = _make_render_plan(qpane_rect)
         self._qpane_rect = qpane_rect
-        self._base_state = base_state
+        self._base_plan = base_plan
         self.viewport = types.SimpleNamespace(
-            pan=QPointF(base_state.current_pan),
+            pan=QPointF(base_plan.current_pan),
             zoom=1.0,
         )
-        self._view = types.SimpleNamespace(viewport=self.viewport)
+        self._view = types.SimpleNamespace(
+            viewport=self.viewport,
+            calculateRenderPlan=self.calculateRenderPlan,
+        )
         self._size = qpane_rect.size()
         self.original_image = QImage(
             qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
@@ -54,36 +57,30 @@ class _DummyRendererHost:
     def view(self):
         return self._view
 
-    def calculateRenderState(self, *, use_pan: QPointF | None = None) -> RenderState:
+    def calculateRenderPlan(self, *, use_pan: QPointF | None = None):
+        """Return the base plan with an overridden pan value when requested."""
         pan = use_pan if use_pan is not None else self.viewport.pan
-        return replace(
-            self._base_state,
+        return make_render_plan(
+            self._qpane_rect,
+            source_image=self._base_plan.base_raster_item.source_image,
+            transform=QTransform(self._base_plan.base_raster_item.transform),
+            strategy=self._base_plan.base_raster_item.strategy,
             current_pan=QPointF(pan),
-            qpane_rect=self._qpane_rect,
             physical_viewport_rect=QRectF(self._qpane_rect),
         )
 
 
-def _make_render_state(qpane_rect: QRect) -> RenderState:
+def _make_render_plan(qpane_rect: QRect):
+    """Return a direct one-layer render plan for dirty-region tests."""
     source_image = QImage(qpane_rect.size(), QImage.Format_ARGB32_Premultiplied)
     source_image.fill(Qt.white)
-    return RenderState(
+    return make_render_plan(
+        qpane_rect,
         source_image=source_image,
-        pyramid_scale=1.0,
         transform=QTransform(),
-        zoom=1.0,
         strategy=RenderStrategy.DIRECT,
-        render_hint_enabled=False,
-        debug_draw_tile_grid=False,
-        tiles_to_draw=[],
-        tile_size=64,
-        tile_overlap=0,
-        max_tile_cols=1,
-        max_tile_rows=1,
-        qpane_rect=qpane_rect,
         current_pan=QPointF(5.0, 3.0),
         physical_viewport_rect=QRectF(qpane_rect),
-        visible_tile_range=None,
     )
 
 
@@ -144,10 +141,10 @@ def test_redraw_base_image_buffer_resets_buffer_pan_when_full_dirty():
     renderer._base_image_buffer.fill(Qt.transparent)
     renderer._buffer_pan = QPointF(-12.0, 7.0)
     renderer._subpixel_pan_offset = QPointF(0.6, 0.4)
-    state = _make_render_state(qpane_rect)
+    plan = _make_render_plan(qpane_rect)
     dirty_region = QRegion(qpane_rect)
-    renderer._redraw_base_image_buffer(dirty_region, state)
-    assert renderer._buffer_pan == state.current_pan
+    renderer._redraw_base_image_buffer(dirty_region, plan)
+    assert renderer._buffer_pan == plan.current_pan
     assert renderer._subpixel_pan_offset == QPointF(0.0, 0.0)
 
 
@@ -161,9 +158,9 @@ def test_redraw_base_image_buffer_keeps_buffer_pan_when_partial_dirty():
     original_buffer_pan = QPointF(-12.0, 7.0)
     renderer._buffer_pan = QPointF(original_buffer_pan)
     renderer._subpixel_pan_offset = QPointF(0.6, 0.4)
-    state = _make_render_state(qpane_rect)
+    plan = _make_render_plan(qpane_rect)
     partial_region = QRegion(QRect(0, 0, qpane_rect.width(), qpane_rect.height() // 2))
-    renderer._redraw_base_image_buffer(partial_region, state)
+    renderer._redraw_base_image_buffer(partial_region, plan)
     assert renderer._buffer_pan == original_buffer_pan
     assert renderer._subpixel_pan_offset == QPointF(0.6, 0.4)
 
@@ -175,31 +172,31 @@ def test_paint_skips_redraw_when_clean():
         qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
     )
     renderer._base_image_buffer.fill(Qt.transparent)
-    state = _make_render_state(qpane_rect)
+    plan = _make_render_plan(qpane_rect)
     calls = []
 
-    def fake_redraw(region, render_state):
-        calls.append((region, render_state))
+    def fake_redraw(region, render_plan):
+        calls.append((region, render_plan))
 
     renderer._redraw_base_image_buffer = fake_redraw  # type: ignore[assignment]
     renderer._dirty_region = QRegion(qpane_rect)
-    renderer.paint(state)
+    renderer.paint(plan)
     assert len(calls) == 1
-    renderer.paint(state)
+    renderer.paint(plan)
     assert len(calls) == 1
 
 
 def test_paint_marks_buffer_on_first_use():
     qpane_rect = QRect(0, 0, 32, 32)
     renderer = Renderer(types.SimpleNamespace())
-    state = _make_render_state(qpane_rect)
+    plan = _make_render_plan(qpane_rect)
     calls = []
 
     def fake_redraw(region, render_state):
         calls.append(region)
 
     renderer._redraw_base_image_buffer = fake_redraw  # type: ignore[assignment]
-    renderer.paint(state)
+    renderer.paint(plan)
     assert len(calls) == 1
     first_region = calls[0]
     assert isinstance(first_region, QRegion)
@@ -212,8 +209,8 @@ def test_renderer_snapshot_metrics_reports_reuse_counters():
     dummy_host = _DummyRendererHost(qpane_rect)
     renderer = Renderer(dummy_host)
     renderer.allocate_buffers(dummy_host.size(), 1.0)
-    initial_state = dummy_host.calculateRenderState(use_pan=dummy_host.viewport.pan)
-    renderer.paint(initial_state)
+    initial_plan = dummy_host.calculateRenderPlan(use_pan=dummy_host.viewport.pan)
+    renderer.paint(initial_plan)
     metrics = renderer.snapshot_metrics()
     assert metrics.base_buffer_allocations == 1
     assert metrics.full_redraws == 1
@@ -222,7 +219,7 @@ def test_renderer_snapshot_metrics_reports_reuse_counters():
     dummy_host.viewport.pan = new_pan
     assert renderer.tryScrollBuffers(new_pan) is True
     renderer.markDirty(QRect(0, 0, 8, 8))
-    renderer.paint(dummy_host.calculateRenderState(use_pan=new_pan))
+    renderer.paint(dummy_host.calculateRenderPlan(use_pan=new_pan))
     updated = renderer.snapshot_metrics()
     assert updated.scroll_attempts == 1
     assert updated.scroll_hits == 1

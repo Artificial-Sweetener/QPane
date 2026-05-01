@@ -17,8 +17,7 @@
 """Unit tests for qpane.ui helper modules."""
 
 from __future__ import annotations
-from PySide6.QtCore import QSizeF, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QSize, QSizeF
 from qpane import Config, QPane
 from qpane.rendering import ViewportZoomMode
 from qpane.ui import dragdrop
@@ -31,12 +30,11 @@ class _StubQPane:
 
 
 def test_is_drag_out_allowed_checks_zoom(qapp):
-    image = QImage(10, 10, QImage.Format_ARGB32)
-    image.fill(Qt.white)
+    image_size = QSize(10, 10)
     viewport_size = QSizeF(20, 20)
     assert (
         is_drag_out_allowed(
-            image=image,
+            image_size=image_size,
             zoom=1.0,
             zoom_mode=ViewportZoomMode.FIT,
             viewport_size=viewport_size,
@@ -46,7 +44,7 @@ def test_is_drag_out_allowed_checks_zoom(qapp):
     constrained_view = QSizeF(15, 15)
     assert (
         is_drag_out_allowed(
-            image=image,
+            image_size=image_size,
             zoom=2.0,
             zoom_mode=ViewportZoomMode.CUSTOM,
             viewport_size=constrained_view,
@@ -55,7 +53,7 @@ def test_is_drag_out_allowed_checks_zoom(qapp):
     )
     assert (
         is_drag_out_allowed(
-            image=image,
+            image_size=image_size,
             zoom=0.5,
             zoom_mode=ViewportZoomMode.CUSTOM,
             viewport_size=viewport_size,
@@ -64,23 +62,50 @@ def test_is_drag_out_allowed_checks_zoom(qapp):
     )
 
 
-def test_drag_out_image_delegates(monkeypatch):
-    received: list[tuple[object, object]] = []
+def test_is_drag_out_allowed_accepts_large_size_without_image_allocation(qapp):
+    image_size = QSize(100_000, 100_000)
+    viewport_size = QSizeF(250_000.0, 250_000.0)
 
-    def fake_start(qpane, event):
-        received.append((qpane, event))
+    assert (
+        is_drag_out_allowed(
+            image_size=image_size,
+            zoom=2.0,
+            zoom_mode=ViewportZoomMode.CUSTOM,
+            viewport_size=viewport_size,
+        )
+        is True
+    )
+
+
+def test_is_drag_out_allowed_rejects_empty_size(qapp):
+    assert (
+        is_drag_out_allowed(
+            image_size=QSize(),
+            zoom=1.0,
+            zoom_mode=ViewportZoomMode.CUSTOM,
+            viewport_size=QSizeF(20, 20),
+        )
+        is False
+    )
+
+
+def test_drag_out_image_delegates(monkeypatch):
+    received: list[tuple[object, object, object, object]] = []
+
+    def fake_start(qpane, event, *, image=None, path=None):
+        received.append((qpane, event, image, path))
 
     monkeypatch.setattr(dragdrop, "maybeStartDrag", fake_start)
     qpane = _StubQPane()
     event = object()
     drag_out_image(qpane, event)
-    assert received == [(qpane, event)]
+    assert received == [(qpane, event, None, None)]
 
 
 def test_drag_out_image_respects_config(monkeypatch, qapp):
     calls: list[tuple[object, object]] = []
 
-    def fake_start(qpane, event):
+    def fake_start(qpane, event, *, image=None, path=None):
         calls.append((qpane, event))
 
     monkeypatch.setattr(dragdrop, "maybeStartDrag", fake_start)

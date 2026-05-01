@@ -49,6 +49,9 @@ from .strokes import MaskStrokeDebugSnapshot, MaskStrokePipeline
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
 
     from ..qpane import QPane
+    from ..scene.model import LayerDescriptor, SceneDescriptor
+    from ..scene.mutations import SceneMutationCoordinator
+    from .scene_mutations import MaskSceneMutationOwner
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +133,8 @@ class MaskService:
         self._pending_activation_images: set[uuid.UUID] = set()
         self._prefetch_stats = _MaskPrefetchStats()
         self._prefetch_scales: Tuple[float, ...] = (0.5, 0.25)
+        self._scene_mutations: SceneMutationCoordinator | None = None
+        self._scene_mutation_owner: MaskSceneMutationOwner | None = None
         self._catalog.onNavigationStarted(self._handle_catalog_navigation_started)
         self._default_resume_cb = (
             lambda image_id=None, qpane_ref=qpane: qpane_ref.resumeOverlays()
@@ -269,6 +274,137 @@ class MaskService:
         """Expose the underlying MaskManager."""
         return self._mask_manager
 
+    def setSceneMutationCoordinator(
+        self, coordinator: "SceneMutationCoordinator | None"
+    ) -> None:
+        """Register mask layer mutations with the internal scene coordinator."""
+        current_owner = self._scene_mutation_owner
+        current_coordinator = self._scene_mutations
+        if current_owner is not None and current_coordinator is not None:
+            current_coordinator.unregister_owner(current_owner)
+        self._scene_mutations = coordinator
+        self._scene_mutation_owner = None
+        if coordinator is None:
+            return
+        from .scene_mutations import MaskSceneMutationOwner
+
+        owner = MaskSceneMutationOwner(self)
+        coordinator.register_owner(owner)
+        self._scene_mutation_owner = owner
+
+    def applySceneMaskOpacity(self, mask_id: uuid.UUID, opacity: float) -> bool:
+        """Apply a validated scene opacity mutation to a mask layer."""
+        return self._mask_controller.setMaskOpacity(mask_id, opacity)
+
+    def applySceneMaskReorder(self, mask_id: uuid.UUID, target_index: int) -> bool:
+        """Apply a validated scene reorder mutation to the mask stack."""
+        image_id = self._catalog.currentImageID()
+        if image_id is None:
+            return False
+        mask_ids = self._mask_manager.get_mask_ids_for_image(image_id)
+        if mask_id not in mask_ids:
+            return False
+        target_mask_index = self._mask_index_for_scene_index(target_index)
+        if target_mask_index is None:
+            return False
+        return self._mask_manager.reorder_mask(image_id, mask_id, target_mask_index)
+
+    def applySceneMaskRemoval(self, mask_id: uuid.UUID) -> bool:
+        """Apply a validated scene removal mutation to a mask layer."""
+        image_id = self._catalog.currentImageID()
+        if image_id is None:
+            return False
+        return self.removeMaskFromImage(image_id, mask_id)
+
+    def applySceneMaskRevisionRequest(self, mask_id: uuid.UUID, *, reason: str) -> bool:
+        """Apply a validated source revision request for a mask layer."""
+        if self._mask_manager.get_layer(mask_id) is None:
+            return False
+        self._mask_controller.bumpMaskStyleRevision(mask_id, reason=reason)
+        self._mask_controller.invalidate_mask_cache(mask_id, reason=reason)
+        self._mask_controller.warmMaskCache(mask_id)
+        self._mask_controller.mask_updated.emit(mask_id, QRect())
+        return True
+
+    def _mask_index_for_scene_index(self, target_index: int) -> int | None:
+        """Translate a scene layer index into mask-domain order."""
+        coordinator = self._scene_mutations
+        scene = coordinator.active_scene() if coordinator is not None else None
+        if scene is None or target_index < 0 or target_index >= len(scene.layers):
+            return None
+        from ..scene.model import LayerKind
+
+        mask_indexes = [
+            index
+            for index, layer in enumerate(scene.layers)
+            if layer.kind == LayerKind.MASK
+        ]
+        if not mask_indexes or target_index < mask_indexes[0]:
+            return None
+        target_mask_index = (
+            sum(1 for index in mask_indexes if index <= target_index) - 1
+        )
+        return max(0, min(target_mask_index, len(mask_indexes) - 1))
+
+    def _scene_layer_for_mask(
+        self, mask_id: uuid.UUID
+    ) -> tuple["SceneDescriptor", "LayerDescriptor"] | None:
+        """Return the active scene/layer pair for ``mask_id`` when visible."""
+        coordinator = self._scene_mutations
+        if coordinator is None:
+            return None
+        from ..scene.sources import MaskLayerSource
+
+        return coordinator.find_layer(
+            lambda layer: isinstance(layer.source, MaskLayerSource)
+            and layer.source.mask_id == mask_id
+        )
+
+    def _route_mask_reorder_through_scene(
+        self, mask_id: uuid.UUID, target_scene_index: int
+    ) -> bool | None:
+        """Route mask reordering through the scene coordinator when possible."""
+        coordinator = self._scene_mutations
+        scene_layer = self._scene_layer_for_mask(mask_id)
+        if coordinator is None or scene_layer is None:
+            return None
+        scene, layer = scene_layer
+        result = coordinator.reorder_layer(
+            scene.scene_id,
+            layer.layer_id,
+            target_scene_index,
+        )
+        return result.changed if result.accepted else False
+
+    def _route_mask_opacity_through_scene(
+        self, mask_id: uuid.UUID, opacity: float
+    ) -> bool | None:
+        """Route mask opacity updates through the scene coordinator when possible."""
+        coordinator = self._scene_mutations
+        scene_layer = self._scene_layer_for_mask(mask_id)
+        if coordinator is None or scene_layer is None:
+            return None
+        scene, layer = scene_layer
+        result = coordinator.set_opacity(scene.scene_id, layer.layer_id, opacity)
+        return result.changed if result.accepted else False
+
+    def _scene_mask_stack_end_index(self, *, forward: bool) -> int | None:
+        """Return the scene index used to rotate mask order."""
+        coordinator = self._scene_mutations
+        scene = coordinator.active_scene() if coordinator is not None else None
+        if scene is None:
+            return None
+        from ..scene.model import LayerKind
+
+        mask_indexes = [
+            index
+            for index, layer in enumerate(scene.layers)
+            if layer.kind == LayerKind.MASK
+        ]
+        if not mask_indexes:
+            return None
+        return mask_indexes[-1] if forward else mask_indexes[0]
+
     def getUndoProvider(self) -> MaskUndoProvider:
         """Expose the undo provider used for mask history integration."""
         return self._mask_manager.undo_provider
@@ -309,7 +445,7 @@ class MaskService:
         self._mask_controller.clear_cache()
 
     def setPrefetchEnabled(self, enabled: bool) -> None:
-        """Enable or disable asynchronous mask overlay prefetch."""
+        """Enable or disable asynchronous mask render prefetch."""
         enabled = bool(enabled)
         if enabled == self._prefetch_enabled:
             return
@@ -354,7 +490,7 @@ class MaskService:
         reason: str = "navigation",
         scales: Sequence[float] | None = None,
     ) -> bool:
-        """Warm mask overlays for image_id using the background executor."""
+        """Warm mask renders for image_id using the background executor."""
         if not self._prefetch_enabled:
             logger.debug("Mask prefetch skipped for %s: disabled", image_id)
             return False
@@ -550,7 +686,21 @@ class MaskService:
             self._pending_activation_images.discard(image_id)
         if active_mask_id in mask_ids:
             if active_mask_id != mask_ids[-1]:
-                moved = self._mask_manager.bring_mask_to_top(image_id, active_mask_id)
+                top_scene_index = self._scene_mask_stack_end_index(forward=True)
+                moved = (
+                    self._route_mask_reorder_through_scene(
+                        active_mask_id,
+                        top_scene_index,
+                    )
+                    if top_scene_index is not None
+                    else None
+                )
+                if moved is None:
+                    moved = self._mask_manager.reorder_mask(
+                        image_id,
+                        active_mask_id,
+                        len(mask_ids) - 1,
+                    )
                 if moved:
                     self._mask_controller.bumpMaskGeneration(
                         active_mask_id, reason="mask_reordered"
@@ -558,7 +708,18 @@ class MaskService:
             return True
         self._invalidate_pending_mask_jobs(active_mask_id, reason="mask_switch")
         top_mask_id = mask_ids[-1]
-        moved = self._mask_manager.bring_mask_to_top(image_id, top_mask_id)
+        top_scene_index = self._scene_mask_stack_end_index(forward=True)
+        moved = (
+            self._route_mask_reorder_through_scene(top_mask_id, top_scene_index)
+            if top_scene_index is not None
+            else None
+        )
+        if moved is None:
+            moved = self._mask_manager.reorder_mask(
+                image_id,
+                top_mask_id,
+                len(mask_ids) - 1,
+            )
         if moved:
             self._mask_controller.bumpMaskGeneration(
                 top_mask_id, reason="mask_reordered"
@@ -572,7 +733,7 @@ class MaskService:
                 )
             except Exception:
                 logger.exception(
-                    "Failed to prefetch mask overlays for %s during activation",
+                    "Failed to prefetch mask renders for %s during activation",
                     image_id,
                 )
             else:
@@ -726,11 +887,11 @@ class MaskService:
         self._mask_controller.invalidateActiveMaskCache()
 
     def invalidateMaskCache(self, mask_id: uuid.UUID | None) -> None:
-        """Invalidate cached overlays for mask_id when present."""
+        """Invalidate cached mask renders for mask_id when present."""
         self._mask_controller.invalidate_mask_cache(mask_id)
 
     def invalidateMaskCachesForImage(self, image_id: uuid.UUID | None) -> None:
-        """Invalidate cached overlays for all masks associated with image_id."""
+        """Invalidate cached mask renders for all masks associated with image_id."""
         if image_id is None:
             return
         self._mask_controller.invalidate_image_cache(image_id)
@@ -870,6 +1031,12 @@ class MaskService:
     ) -> QPixmap | None:
         """Get the colorized pixmap for ``mask_layer`` when available."""
         return self._mask_controller.get_colorized_mask(mask_layer, scale=scale)
+
+    def getColorizedMaskById(
+        self, mask_id: uuid.UUID, *, scale: float | None = None
+    ) -> QPixmap | None:
+        """Get the colorized pixmap for ``mask_id`` when available."""
+        return self._mask_controller.get_colorized_mask_by_id(mask_id, scale=scale)
 
     def predict_mask_from_box(
         self,
@@ -1097,9 +1264,7 @@ class MaskService:
         elif completed:
             summary = f"{summary_prefix} for {self._format_uuid(image_id)}"
         else:
-            summary = (
-                f"Prefetch found cached overlays for {self._format_uuid(image_id)}"
-            )
+            summary = f"Prefetch found cached renders for {self._format_uuid(image_id)}"
         if duration_ms is not None:
             summary = f"{summary} ({duration_ms:.1f} ms)"
         self._prefetch_stats.last_message = summary
@@ -1422,13 +1587,39 @@ class MaskService:
         layer = self._mask_manager.get_layer(mask_id)
         if layer is None:
             return False
-        self._mask_controller.setMaskProperties(mask_id, color, opacity)
-        return True
+        changed = False
+        if color is not None:
+            changed = self._mask_controller.setMaskColor(mask_id, color) or changed
+        if opacity is not None:
+            routed = self._route_mask_opacity_through_scene(mask_id, opacity)
+            if routed is None:
+                routed = self._mask_controller.setMaskOpacity(mask_id, opacity)
+            changed = routed or changed
+        return changed
 
     def cycleMasks(self, image_id: uuid.UUID, *, forward: bool) -> None:
         """Cycle mask ordering for image_id and refresh controller cache."""
         previous_active = self._mask_controller.get_active_mask_id()
-        new_top = self._mask_manager.cycle_mask_order(image_id, forward)
+        mask_ids = self._mask_manager.get_mask_ids_for_image(image_id)
+        if len(mask_ids) >= 2:
+            moving_mask = mask_ids[0] if forward else mask_ids[-1]
+            target_index = self._scene_mask_stack_end_index(forward=forward)
+            moved = (
+                self._route_mask_reorder_through_scene(moving_mask, target_index)
+                if target_index is not None
+                else None
+            )
+            if moved is None:
+                target_mask_index = len(mask_ids) - 1 if forward else 0
+                moved = self._mask_manager.reorder_mask(
+                    image_id,
+                    moving_mask,
+                    target_mask_index,
+                )
+        else:
+            moved = False
+        new_order = self._mask_manager.get_mask_ids_for_image(image_id)
+        new_top = new_order[-1] if moved and new_order else None
         direction = "forward" if forward else "backward"
         if new_top:
             if previous_active is not None and previous_active != new_top:
@@ -1463,7 +1654,21 @@ class MaskService:
                 label="Mask Error",
             )
             return False
-        was_moved = manager.bring_mask_to_top(current_image_id, mask_id)
+        mask_ids = manager.get_mask_ids_for_image(current_image_id)
+        if mask_id not in mask_ids:
+            was_moved = False
+        else:
+            top_scene_index = self._scene_mask_stack_end_index(forward=True)
+            routed = (
+                self._route_mask_reorder_through_scene(mask_id, top_scene_index)
+                if top_scene_index is not None
+                else None
+            )
+            was_moved = (
+                manager.reorder_mask(current_image_id, mask_id, len(mask_ids) - 1)
+                if routed is None
+                else routed
+            )
         if was_moved:
             controller = self._mask_controller
             if controller is not None:
@@ -1533,7 +1738,7 @@ class MaskService:
 
 
 class MaskPrefetchWorker(QRunnable, BaseWorker):
-    """Background worker that prepares colorized mask overlays off the UI thread."""
+    """Background worker that prepares colorized mask renders off the UI thread."""
 
     def __init__(
         self,
@@ -1545,7 +1750,7 @@ class MaskPrefetchWorker(QRunnable, BaseWorker):
         service: "MaskService",
         scales: Sequence[float] | None = None,
     ) -> None:
-        """Record collaborators required to pre-colorize mask overlays."""
+        """Record collaborators required to pre-colorize mask renders."""
         QRunnable.__init__(self)
         BaseWorker.__init__(self, logger=logger.getChild("MaskPrefetchWorker"))
         self._image_id = image_id

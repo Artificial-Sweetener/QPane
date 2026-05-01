@@ -19,8 +19,6 @@
 from __future__ import annotations
 
 
-import uuid
-
 from typing import TYPE_CHECKING
 
 
@@ -45,14 +43,18 @@ from .coordinates import PanelHitTest
 
 from .presenter import RenderingPresenter
 
-from .tiles import TileIdentifier
+from ..scene.identity import SceneLayerTileKey
 
 
 if TYPE_CHECKING:  # pragma: no cover - import guard for typing only
 
     from ..concurrency import TaskExecutorProtocol
     from ..qpane import QPane
-    from ..rendering import RenderState, Renderer
+    from ..scene.render_plan import SceneRenderPlan
+    from ..scene.render_plan import SceneContentSnapshot
+    from ..scene.render_plan import SceneLayerHitTestResult
+    from ..scene.model import SceneDescriptor
+    from ..rendering import Renderer
     from ..core.diagnostics_broker import Diagnostics
 
 
@@ -101,6 +103,9 @@ class View:
             link_manager=self.link_manager,
             swap_delegate=self.swap_delegate,
         )
+        self.presenter.set_placeholder_content_provider(
+            self.catalog_controller.placeholder_content
+        )
         self.swap_delegate.attach_catalog_controller(self.catalog_controller)
         self._connect_rendering_signals()
 
@@ -109,14 +114,34 @@ class View:
         self.presenter.renderer = renderer
         self.renderer = renderer
 
-    def calculateRenderState(
+    def calculateRenderPlan(
         self,
         *,
         use_pan: QPointF | None = None,
         is_blank: bool = False,
-    ) -> "RenderState | None":
-        """Delegate RenderState calculation to the presenter."""
-        return self.presenter.calculateRenderState(use_pan=use_pan, is_blank=is_blank)
+    ) -> "SceneRenderPlan | None":
+        """Delegate scene render-plan calculation to the presenter."""
+        return self.presenter.calculateRenderPlan(use_pan=use_pan, is_blank=is_blank)
+
+    def current_content_snapshot(self) -> "SceneContentSnapshot | None":
+        """Expose the current rendered content geometry."""
+        return self.presenter.current_content_snapshot()
+
+    def current_scene_descriptor(self) -> "SceneDescriptor | None":
+        """Expose the active scene descriptor for internal mutation validation."""
+        return self.presenter.current_scene_descriptor()
+
+    def invalidate_content_cache(self) -> None:
+        """Drop cached scene/content geometry in the presenter."""
+        self.presenter.invalidate_content_cache()
+
+    def has_renderable_content(self) -> bool:
+        """Return True when rendering can resolve scene content."""
+        return self.presenter.has_renderable_content()
+
+    def content_rect(self) -> QRect:
+        """Return the base content rectangle in content coordinates."""
+        return self.presenter.content_rect()
 
     def mark_dirty(self, dirty_rect: QRect | QRectF | None = None) -> None:
         """Forward dirty-region tracking to the presenter."""
@@ -142,6 +167,10 @@ class View:
         """Expose viewport hit testing for panel coordinates."""
         return self.presenter.panel_hit_test(panel_pos)
 
+    def scene_hit_test(self, panel_pos: QPoint) -> "SceneLayerHitTestResult | None":
+        """Expose internal scene hit testing for panel coordinates."""
+        return self.presenter.scene_hit_test(panel_pos)
+
     def image_to_panel_point(self, image_point: QPoint) -> QPointF | None:
         """Convert image coordinates to panel coordinates via the presenter."""
         return self.presenter.image_to_panel_point(image_point)
@@ -160,13 +189,13 @@ class View:
             tier="detail",
         )
 
-    def handle_tile_ready(self, identifier: TileIdentifier) -> None:
+    def handle_tile_ready(self, key: SceneLayerTileKey) -> None:
         """Forward tile-ready signals to the swap delegate."""
-        self.swap_delegate.handle_tile_ready(identifier)
+        self.swap_delegate.handle_tile_ready(key)
 
-    def handle_pyramid_ready(self, image_id: uuid.UUID | None) -> None:
+    def handle_pyramid_ready(self, asset_key: object | None) -> None:
         """Bridge pyramid-ready notifications from the catalog to swap plumbing."""
-        self.swap_delegate.handle_pyramid_ready(image_id)
+        self.swap_delegate.handle_pyramid_ready(asset_key)
 
     def _attach_pyramid_manager(self) -> None:
         """Wire the catalog's pyramid manager into the shared cache registry."""

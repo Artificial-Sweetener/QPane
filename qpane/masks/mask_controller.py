@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 @dataclass(frozen=True, slots=True)
 class MaskOverlayMetrics:
-    """Snapshot of mask overlay cache health for diagnostics."""
+    """Snapshot of mask render cache health for diagnostics."""
 
     cache_bytes: int
     entry_count: int
@@ -83,6 +83,20 @@ class MaskReadyUpdate:
     dirty_rect: QRect | None
     mask_layer: "MaskLayer" | None
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MaskRenderCacheKey:
+    """Stable identity for one cached colorized mask render."""
+
+    mask_id: uuid.UUID
+    render_revision: int
+    scale_key: float | None
+
+    def __post_init__(self) -> None:
+        """Validate cache-key revision metadata."""
+        if self.render_revision < 0:
+            raise ValueError("mask render revision must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,11 +234,13 @@ class MaskController(QObject):
         self._stroke_diagnostics = stroke_diagnostics
         self._active_mask_id = None
         self._mask_generations: dict[uuid.UUID, int] = {}
+        self._mask_style_generations: dict[uuid.UUID, int] = {}
+        self._mask_config_generation = 0
         self._premultiplied_alpha_lut = self._create_premultiplied_alpha_lut()
-        self._colorized_mask_cache: OrderedDict[tuple[int, float | None], QPixmap] = (
+        self._colorized_mask_cache: OrderedDict[MaskRenderCacheKey, QPixmap] = (
             OrderedDict()
         )
-        self._colorized_mask_bytes: dict[tuple[int, float | None], int] = {}
+        self._colorized_mask_bytes: dict[MaskRenderCacheKey, int] = {}
         self._colorized_cache_total_bytes: int = 0
         self._cache_hits: int = 0
         self._cache_misses: int = 0
@@ -240,8 +256,7 @@ class MaskController(QObject):
         self._colorize_slow_count: int = 0
         self._colorize_threshold_ms: float = 25.0
         self._colorize_last_source: str | None = None
-        self._layer_ids: dict[int, uuid.UUID] = {}
-        self._layer_cache_index: dict[int, set[tuple[int, float | None]]] = {}
+        self._mask_cache_index: dict[uuid.UUID, set[MaskRenderCacheKey]] = {}
         self._missing_cv2_warned = False
         self._prefetch_requested: int = 0
         self._prefetch_completed: int = 0
@@ -260,16 +275,13 @@ class MaskController(QObject):
             uuid.UUID, OrderedDict[float, QImage]
         ] = OrderedDict()
         self._cache_admission_guard = None
-        self._rejected_cache_keys: set[tuple[int, float | None]] = set()
+        self._rejected_cache_keys: set[MaskRenderCacheKey] = set()
 
     def _get_layer(self, mask_id) -> "MaskLayer | None":
         """Return the mask layer for ``mask_id`` if it exists."""
         if mask_id is None:
             return None
-        layer = self.mask_manager.get_layer(mask_id)
-        if layer is not None:
-            self._register_layer_identity(mask_id, layer)
-        return layer
+        return self.mask_manager.get_layer(mask_id)
 
     def _record_stroke_event(self, event: str) -> None:
         """Record mask stroke diagnostics when trackers are configured."""
@@ -290,24 +302,11 @@ class MaskController(QObject):
             return QImage()
         return mask_layer.surface.snapshot_qimage()
 
-    def _register_layer_identity(
-        self, mask_id: uuid.UUID, mask_layer: MaskLayer
-    ) -> None:
-        """Cache the association between a mask layer instance and its identifier."""
-        self._layer_ids[id(mask_layer)] = mask_id
-
     def _resolve_mask_id(self, mask_layer: MaskLayer | None) -> uuid.UUID | None:
         """Return the mask identifier for `mask_layer` when available."""
         if mask_layer is None:
             return None
-        key = id(mask_layer)
-        mask_id = self._layer_ids.get(key)
-        if mask_id is not None:
-            return mask_id
-        mask_id = self.mask_manager.find_mask_id_for_layer(mask_layer)
-        if mask_id is not None:
-            self._layer_ids[key] = mask_id
-        return mask_id
+        return self.mask_manager.find_mask_id_for_layer(mask_layer)
 
     def _ensure_stroke_accumulator(self, mask_id: uuid.UUID) -> _StrokeAccumulator:
         """Return the accumulator for `mask_id`, creating it when missing."""
@@ -343,9 +342,41 @@ class MaskController(QObject):
             )
         return next_generation
 
+    def bumpMaskStyleRevision(
+        self, mask_id: uuid.UUID, *, reason: str | None = None
+    ) -> int:
+        """Advance and return the style revision counter for ``mask_id``."""
+        next_generation = self._mask_style_generations.get(mask_id, 0) + 1
+        self._mask_style_generations[mask_id] = next_generation
+        if reason:
+            logger.debug(
+                "Mask %s style generation advanced to %s (%s).",
+                mask_id,
+                next_generation,
+                reason,
+            )
+        return next_generation
+
+    def maskRenderRevision(self, mask_id: uuid.UUID) -> int:
+        """Return the render revision used by scene and colorized-mask caches."""
+        layer = self.mask_manager.get_layer(mask_id)
+        surface_generation = 0
+        if layer is not None:
+            surface_generation = max(0, int(layer.surface.generation))
+        content_generation = max(0, int(self.getMaskGeneration(mask_id)))
+        style_generation = max(0, int(self._mask_style_generations.get(mask_id, 0)))
+        config_generation = max(0, int(self._mask_config_generation))
+        return (
+            surface_generation
+            + (content_generation << 20)
+            + (style_generation << 40)
+            + (config_generation << 52)
+        )
+
     def discardMaskGeneration(self, mask_id: uuid.UUID) -> None:
         """Forget controller generation tracking for `mask_id`."""
         self._mask_generations.pop(mask_id, None)
+        self._mask_style_generations.pop(mask_id, None)
 
     def prepareStrokeJob(
         self,
@@ -578,10 +609,14 @@ class MaskController(QObject):
         return round(value, 4)
 
     def _cache_key(
-        self, mask_layer: MaskLayer, scale_key: float | None
-    ) -> tuple[int, float | None]:
-        """Build a composite cache key from the layer identity and scale marker."""
-        return (id(mask_layer), scale_key)
+        self, mask_id: uuid.UUID, scale_key: float | None
+    ) -> MaskRenderCacheKey:
+        """Build a stable cache key from mask identity, revision, and scale."""
+        return MaskRenderCacheKey(
+            mask_id=mask_id,
+            render_revision=self.maskRenderRevision(mask_id),
+            scale_key=scale_key,
+        )
 
     def _target_scaled_size(self, size: QSize, scale_key: float) -> QSize:
         """Return the integer QSize that corresponds to applying `scale_key`."""
@@ -598,6 +633,7 @@ class MaskController(QObject):
         self._mask_config = mask_config or require_mask_config(config)
         if previous_config.mask_border_enabled != self._mask_config.mask_border_enabled:
             self._missing_cv2_warned = False
+            self._mask_config_generation += 1
             self.clear_cache()
             if self._active_mask_id is not None:
                 self._warm_mask_cache(self._active_mask_id)
@@ -675,7 +711,7 @@ class MaskController(QObject):
             logger.exception("Mask cache usage callback failed")
 
     def record_prefetch_request(self, count: int) -> None:
-        """Track the number of mask overlays scheduled for prefetch work."""
+        """Track the number of mask renders scheduled for prefetch work."""
         if count <= 0:
             return
         self._prefetch_requested += count
@@ -714,7 +750,7 @@ class MaskController(QObject):
     def invalidate_mask_cache(
         self, mask_id: uuid.UUID | None, *, reason: str = "invalidate"
     ) -> None:
-        """Invalidate cached overlays for ``mask_id`` when available."""
+        """Invalidate cached mask renders for ``mask_id`` when available."""
         if mask_id is None:
             return
         mask_layer = self._get_layer(mask_id)
@@ -723,7 +759,7 @@ class MaskController(QObject):
     def invalidate_image_cache(
         self, image_id: uuid.UUID, *, reason: str = "image_invalidate"
     ) -> None:
-        """Invalidate cached overlays for all masks linked to ``image_id``."""
+        """Invalidate cached mask renders for all masks linked to ``image_id``."""
         mask_ids = self.mask_manager.get_mask_ids_for_image(image_id)
         for mask_id in mask_ids:
             self.invalidate_mask_cache(mask_id, reason=reason)
@@ -763,11 +799,9 @@ class MaskController(QObject):
         """Build a colorized mask image while recording timing metrics."""
         if self._layer_is_empty(mask_layer):
             return None
-        if mask_id is not None:
-            self._register_layer_identity(mask_id, mask_layer)
-            resolved_id = mask_id
-        else:
-            resolved_id = self._resolve_mask_id(mask_layer)
+        resolved_id = (
+            mask_id if mask_id is not None else self._resolve_mask_id(mask_layer)
+        )
         snapshot = self._snapshot_layer_image(mask_layer)
         if snapshot.isNull():
             return None
@@ -792,8 +826,7 @@ class MaskController(QObject):
         self._store_prefetched_image(mask_id, image)
         self._store_prefetched_scaled_images(mask_id, scaled)
         pixmap = QPixmap.fromImage(image)
-        cache_key = self._cache_key(mask_layer, None)
-        self._register_layer_identity(mask_id, mask_layer)
+        cache_key = self._cache_key(mask_id, None)
         self._cache_misses += 1
         self._record_cache_insert(cache_key, pixmap, mask_id=mask_id)
         if scaled:
@@ -801,7 +834,7 @@ class MaskController(QObject):
                 normalized_scale = self._normalize_scale_key(scale_value)
                 if normalized_scale is None or scaled_image.isNull():
                     continue
-                scaled_cache_key = self._cache_key(mask_layer, normalized_scale)
+                scaled_cache_key = self._cache_key(mask_id, normalized_scale)
                 scaled_pixmap = QPixmap.fromImage(scaled_image)
                 self._record_cache_insert(
                     scaled_cache_key, scaled_pixmap, mask_id=mask_id
@@ -810,19 +843,33 @@ class MaskController(QObject):
 
     def setMaskProperties(self, mask_id, color: QColor = None, opacity: float = None):
         """Update mask presentation details and emit when values change."""
+        color_changed = (
+            self.setMaskColor(mask_id, color) if color is not None else False
+        )
+        opacity_changed = (
+            self.setMaskOpacity(mask_id, opacity) if opacity is not None else False
+        )
+        return color_changed or opacity_changed
+
+    def setMaskColor(self, mask_id: uuid.UUID, color: QColor | None) -> bool:
+        """Update mask color and advance the mask render style revision."""
         mask_layer = self._get_layer(mask_id)
-        if mask_layer is None:
+        if mask_layer is None or color is None or color == mask_layer.color:
             return False
-        changed = False
-        if color is not None and color != mask_layer.color:
-            changed = True
-        if opacity is not None and opacity != mask_layer.opacity:
-            changed = True
-        if not changed:
-            return False
-        self.mask_manager.set_mask_properties(mask_id, color, opacity)
-        self._invalidate_colorized_mask_cache(mask_layer)
+        self.mask_manager.set_mask_properties(mask_id, color=color, opacity=None)
+        self.bumpMaskStyleRevision(mask_id, reason="mask_color_changed")
+        self._invalidate_colorized_mask_cache_for_id(mask_id)
         self._warm_mask_cache(mask_id)
+        self.active_mask_properties_changed.emit()
+        self.mask_updated.emit(mask_id, QRect())
+        return True
+
+    def setMaskOpacity(self, mask_id: uuid.UUID, opacity: float | None) -> bool:
+        """Update mask opacity without invalidating colorized mask renders."""
+        mask_layer = self._get_layer(mask_id)
+        if mask_layer is None or opacity is None or opacity == mask_layer.opacity:
+            return False
+        self.mask_manager.set_mask_properties(mask_id, color=None, opacity=opacity)
         self.active_mask_properties_changed.emit()
         self.mask_updated.emit(mask_id, QRect())
         return True
@@ -883,7 +930,6 @@ class MaskController(QObject):
             self._drop_cached_mask(key, reason="clear")
         self._colorized_mask_cache.clear()
         self._colorized_mask_bytes.clear()
-        self._layer_cache_index.clear()
         self._colorized_cache_total_bytes = 0
         self._rejected_cache_keys.clear()
         self._notify_cache_usage()
@@ -916,17 +962,6 @@ class MaskController(QObject):
     def redoMaskEdit(self) -> bool:
         """Redo the previously undone mask change for the active layer."""
         return self._apply_history_operation(self.mask_manager.redo_mask)
-
-    def cycle_active_mask(self, image_id, forward: bool = True):
-        """Calls the MaskManager to cycle the layer order and then updates the
-
-        active mask to be the new top layer.
-        """
-        new_top_id = self.mask_manager.cycle_mask_order(image_id, forward)
-        if new_top_id:
-            self.bumpMaskGeneration(new_top_id, reason="cycle_active_mask")
-            self.setActiveMaskID(new_top_id)
-            self.mask_updated.emit(new_top_id, QRect())
 
     def pushUndoState(self):
         """Prepare the patch accumulator for the next undoable stroke."""
@@ -1037,7 +1072,7 @@ class MaskController(QObject):
         sub_mask_image: QImage | None = None,
         colorized_image: QImage | None = None,
     ):
-        """Refresh cached overlays for `dirty_image_rect` on the active layer.
+        """Refresh cached mask renders for `dirty_image_rect` on the active layer.
 
         When `sub_mask_image` is supplied the caller has already copied the
         updated mask snippet, so we reuse it instead of issuing another copy.
@@ -1101,9 +1136,12 @@ class MaskController(QObject):
         else:
             cache_painter.drawPixmap(dirty_image_rect.topLeft(), snippet_pixmap)
         cache_painter.end()
-        layer_key = id(active_mask_layer)
-        for cache_key in self._layer_cache_index.get(layer_key, ()):
-            _, scale_key = cache_key
+        if mask_uuid is None:
+            cache_keys: set[MaskRenderCacheKey] = set()
+        else:
+            cache_keys = self._mask_cache_index.get(mask_uuid, set())
+        for cache_key in cache_keys:
+            scale_key = cache_key.scale_key
             if scale_key is None:
                 continue
             scaled_pixmap = self._colorized_mask_cache.get(cache_key)
@@ -1230,9 +1268,7 @@ class MaskController(QObject):
             return 0
         excluded = exclude or set()
         for key in list(self._colorized_mask_cache.keys()):
-            layer_key, _ = key
-            mask_uuid = self._layer_ids.get(layer_key)
-            if mask_uuid is not None and mask_uuid in excluded:
+            if key.mask_id in excluded:
                 continue
             return self._drop_cached_mask(key, reason=reason)
         return 0
@@ -1250,9 +1286,7 @@ class MaskController(QObject):
         depth = pixmap.depth() or 32
         return size.width() * size.height() * (depth // 8)
 
-    def _allow_cache_insert(
-        self, size_bytes: int, key: tuple[int, float | None]
-    ) -> bool:
+    def _allow_cache_insert(self, size_bytes: int, key: MaskRenderCacheKey) -> bool:
         """Return True when ``size_bytes`` is within configured guardrails."""
         size = max(0, int(size_bytes))
         budget_limit = self.mask_cache_limit_bytes()
@@ -1278,20 +1312,17 @@ class MaskController(QObject):
             return False
         return True
 
-    def _drop_cached_mask(self, key: tuple[int, float | None], *, reason: str) -> int:
+    def _drop_cached_mask(self, key: MaskRenderCacheKey, *, reason: str) -> int:
         """Remove a cached pixmap entry and return the freed byte count."""
         self._colorized_mask_cache.pop(key, None)
         size = self._colorized_mask_bytes.pop(key, 0)
-        layer_key, _ = key
-        mask_uuid = self._layer_ids.get(layer_key)
-        bucket = self._layer_cache_index.get(layer_key)
+        mask_uuid = key.mask_id
+        bucket = self._mask_cache_index.get(mask_uuid)
         if bucket is not None:
             bucket.discard(key)
             if not bucket:
-                self._layer_cache_index.pop(layer_key, None)
-                if mask_uuid is not None:
-                    self._prefetched_scaled_images.pop(mask_uuid, None)
-                self._layer_ids.pop(layer_key, None)
+                self._mask_cache_index.pop(mask_uuid, None)
+                self._prefetched_scaled_images.pop(mask_uuid, None)
         if size:
             self._colorized_cache_total_bytes = max(
                 0, self._colorized_cache_total_bytes - size
@@ -1304,7 +1335,7 @@ class MaskController(QObject):
 
     def _record_cache_insert(
         self,
-        key: tuple[int, float | None],
+        key: MaskRenderCacheKey,
         pixmap: QPixmap,
         *,
         mask_id: uuid.UUID | None = None,
@@ -1321,11 +1352,8 @@ class MaskController(QObject):
         self._colorized_mask_cache[key] = pixmap
         self._colorized_mask_cache.move_to_end(key)
         self._colorized_mask_bytes[key] = size_bytes
-        layer_key, _ = key
-        bucket = self._layer_cache_index.setdefault(layer_key, set())
+        bucket = self._mask_cache_index.setdefault(key.mask_id, set())
         bucket.add(key)
-        if mask_id is not None:
-            self._layer_ids[layer_key] = mask_id
         self._colorized_cache_total_bytes += size_bytes
         exclude_ids: set[uuid.UUID] = set()
         if mask_id is not None:
@@ -1338,7 +1366,7 @@ class MaskController(QObject):
     def _evict_until_within_budget(
         self, *, reason: str, exclude: set[uuid.UUID] | None = None
     ) -> None:
-        """Trim cached overlays until they fit within the configured budget."""
+        """Trim cached mask renders until they fit within the configured budget."""
         limit = self.mask_cache_limit_bytes()
         if limit <= 0:
             return
@@ -1385,13 +1413,17 @@ class MaskController(QObject):
         self, mask_layer: MaskLayer | None, *, reason: str = "invalidate"
     ):
         """Invalidate cached pixmaps for ``mask_layer`` at all scales."""
-        if mask_layer is None:
-            return
         mask_id = self._resolve_mask_id(mask_layer)
-        if mask_id is not None:
-            self._forget_prefetched_image(mask_id)
-        layer_key = id(mask_layer)
-        for cache_key in list(self._layer_cache_index.get(layer_key, ())):
+        if mask_id is None:
+            return
+        self._invalidate_colorized_mask_cache_for_id(mask_id, reason=reason)
+
+    def _invalidate_colorized_mask_cache_for_id(
+        self, mask_id: uuid.UUID, *, reason: str = "invalidate"
+    ) -> None:
+        """Invalidate cached pixmaps for ``mask_id`` at all scales."""
+        self._forget_prefetched_image(mask_id)
+        for cache_key in list(self._mask_cache_index.get(mask_id, ())):
             self._drop_cached_mask(cache_key, reason=reason)
 
     def _warm_mask_cache(self, mask_id):
@@ -1408,13 +1440,22 @@ class MaskController(QObject):
     ) -> QPixmap | None:
         """Retrieve a colorized pixmap, optionally scaled for caching."""
         scale_key = self._normalize_scale_key(scale)
-        cache_key = self._cache_key(mask_layer, scale_key)
+        mask_id = self._resolve_mask_id(mask_layer)
+        if mask_id is None:
+            if mask_layer.mask_image.isNull():
+                return None
+            return self.colorize_mask(
+                mask_layer.mask_image,
+                mask_layer.color,
+                mask_id=None,
+                source="cache_miss",
+            )
+        cache_key = self._cache_key(mask_id, scale_key)
         pixmap = self._colorized_mask_cache.get(cache_key)
         if pixmap is not None:
             self._colorized_mask_cache.move_to_end(cache_key)
             self._cache_hits += 1
             return pixmap
-        mask_id = self._resolve_mask_id(mask_layer)
         if scale_key is not None and mask_id is not None:
             stored_bucket = self._prefetched_scaled_images.get(mask_id)
             if stored_bucket is not None:
@@ -1463,7 +1504,7 @@ class MaskController(QObject):
                 source="cache_miss",
             )
         else:
-            base_key = self._cache_key(mask_layer, None)
+            base_key = self._cache_key(mask_id, None)
             base_pixmap = self._colorized_mask_cache.get(base_key)
             if base_pixmap is not None:
                 self._colorized_mask_cache.move_to_end(base_key)
@@ -1507,13 +1548,25 @@ class MaskController(QObject):
             return None
         return self._get_colorized_mask(mask_layer, scale=scale)
 
+    def get_colorized_mask_by_id(
+        self, mask_id: uuid.UUID, *, scale: float | None = None
+    ) -> QPixmap | None:
+        """Return the cached pixmap for ``mask_id`` at the requested scale."""
+        mask_layer = self._get_layer(mask_id)
+        if mask_layer is None:
+            return None
+        return self._get_colorized_mask(mask_layer, scale=scale)
+
     def _apply_history_delta(
         self, mask_layer: MaskLayer, change: MaskHistoryChange
     ) -> bool:
-        """Apply cached undo/redo snippets directly to cached overlays."""
+        """Apply cached undo/redo snippets directly to cached mask renders."""
         if not change.snippets:
             return False
-        base_key = self._cache_key(mask_layer, None)
+        mask_id = self._resolve_mask_id(mask_layer)
+        if mask_id is None:
+            return False
+        base_key = self._cache_key(mask_id, None)
         base_pixmap = self._colorized_mask_cache.get(base_key)
         if base_pixmap is None or base_pixmap.isNull():
             return False

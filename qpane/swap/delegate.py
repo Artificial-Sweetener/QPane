@@ -23,10 +23,10 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
-from PySide6.QtCore import QRect, QRectF, QSizeF
+from PySide6.QtCore import QRect, QRectF
 
 from ..core import Config, PrefetchSettings
-from ..rendering import TileIdentifier
+from ..scene.identity import SceneLayerAssetKey, SceneLayerTileKey
 from .coordinator import SwapCoordinator, SwapCoordinatorMetrics
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -160,35 +160,34 @@ class SwapDelegate:
         """Inform the coordinator that SAM support is unavailable."""
         self._coordinator.on_sam_manager_detached()
 
-    def handle_tile_ready(self, identifier: TileIdentifier) -> None:
+    def handle_tile_ready(self, key: SceneLayerTileKey) -> None:
         """Mark the active region dirty when a matching prefetched tile arrives."""
+        if not self._rendering.has_renderable_content():
+            return
+        dirty_rect = self._rendering.dirty_rect_for_tile_key(key)
+        if dirty_rect is None:
+            return
+        self._mark_dirty(dirty_rect)
+
+    def handle_pyramid_ready(self, asset_key: SceneLayerAssetKey | None) -> None:
+        """Trigger a repaint when the active image's pyramid finishes."""
         qpane = self._qpane
-        if qpane.original_image.isNull():
+        if asset_key is None:
             return
-        if identifier.image_id != qpane.currentImageID():
-            return
-        render_state = self._rendering.calculateRenderState(
+        render_plan = self._rendering.calculateRenderPlan(
             use_pan=None,
             is_blank=qpane._is_blank,
         )
-        if render_state is None:
+        if render_plan is None:
             return
-        if abs(identifier.pyramid_scale - render_state.pyramid_scale) > 1e-6:
+        if not any(
+            getattr(item, "pyramid_asset_key", None) == asset_key
+            for item in render_plan.render_items
+        ):
             return
-        draw_pos = self._rendering.get_tile_draw_position(identifier)
-        tile_size = self._tile_manager.tile_size
-        source_rect = QRectF(draw_pos, QSizeF(tile_size, tile_size))
-        panel_rect_f = render_state.transform.mapRect(source_rect)
-        dirty_rect = panel_rect_f.adjusted(-1, -1, 1, 1).toRect()
-        self._mark_dirty(dirty_rect)
-
-    def handle_pyramid_ready(self, image_id: uuid.UUID | None) -> None:
-        """Trigger a repaint when the active image's pyramid finishes."""
-        qpane = self._qpane
-        if image_id is not None and image_id == qpane.currentImageID():
-            logger.info(
-                "Pyramid ready for current image; scheduling repaint (image_id=%s)",
-                image_id,
-            )
-            qpane.markDirty()
-            qpane.update()
+        logger.info(
+            "Pyramid ready for current scene layer; scheduling repaint (asset_key=%s)",
+            asset_key,
+        )
+        qpane.markDirty()
+        qpane.update()

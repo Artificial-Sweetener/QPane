@@ -8,7 +8,7 @@ QPane works out of the box with defaults that balance performance and usability.
 `Config` is your control panel. It captures runtime settings like cache budgets, tiling choices, and feature flags. It behaves like a snapshot: you create it, configure it, and pass it to the `QPane` constructor. The viewer keeps its own copy, so you can reuse your config object for other windows without side effects.
 
 ### Create and Clone
-Start with a default config, then branch it for different windows or user modes. Use `Config.copy()` to create an independent snapshot. This deep-copies nested structures (like cache weights) so you can tweak one config without affecting others.
+Start with a default config, then branch it for different windows or user modes. Use `Config.copy()` to create an independent snapshot. This deep-copies nested structures (like cache weights) so you can tweak one config without affecting others. Use `Config.as_dict()` when a settings panel or debug log needs the current snapshot as plain JSON-serializable values.
 
 ```python
 from qpane import Config
@@ -28,8 +28,7 @@ print(kiosk_config.as_dict())
 
 ## Applying Changes
 ### Update a Live Viewer
-`QPane.applySettings` replaces the active configuration and reconfigures services. This is a "heavy" operation that may trigger repaints or cache rebuilds, so use it for mode switches rather than per-frame updates.
-In the demo, SAM checkpoint settings apply live only in background mode; blocking/disabled changes are queued until a restart.
+`QPane.applySettings` replaces the active configuration and reconfigures services. This is a "heavy" operation that may trigger repaints or cache rebuilds, so use it for mode switches rather than per-frame updates. In the demo, SAM checkpoint settings apply live only in background mode; blocking/disabled changes are queued until a restart.
 
 You can inspect the current state via `QPane.settings` (read-only) or check `QPane.installedFeatures` to see which requested features (like "mask" or "sam") are actually available.
 
@@ -39,9 +38,7 @@ from qpane import QPane
 viewer = QPane(config=kiosk_config)
 
 # Later, switch modes live:
-viewer.applySettings(
-    overrides={"diagnostics_overlay_enabled": True}
-)
+viewer.applySettings(diagnostics_overlay_enabled=True)
 ```
 
 ### Merge Settings
@@ -63,11 +60,11 @@ config = base_config.copy().configure(user_prefs)
 QPane's caching engine balances performance against memory usage. You can choose between two strategies depending on your environment.
 
 ### Choosing a Strategy (`CacheMode`)
-*   **Auto Mode (`CacheMode.AUTO`):** The default "good citizen." It monitors system RAM (via `psutil`) and evicts tiles to keep `headroom_percent` free.
-    *   *Best for:* Desktop apps where QPane is the primary focus.
-    *   *Heads-up:* If `psutil` is missing, this falls back to a hard 1GB limit.
-*   **Hard Mode (`CacheMode.HARD`):** A strict budget. QPane will never use more than `budget_mb`, ignoring system pressure.
-    *   *Best for:* Kiosks, Docker containers, or sidebars where QPane must stay in its lane.
+* **Auto Mode (`CacheMode.AUTO`):** The default "good citizen." It monitors system RAM (via `psutil`) and evicts tiles to keep `headroom_percent` free.
+    * *Best for:* Desktop apps where QPane is the primary focus.
+    * *Heads-up:* If `psutil` is missing, this falls back to a hard 1GB limit.
+* **Hard Mode (`CacheMode.HARD`):** A strict budget. QPane will never use more than `budget_mb`, ignoring system pressure.
+    * *Best for:* Kiosks, Docker containers, or sidebars where QPane must stay in its lane.
 
 ### Fine-Tuning
 You can further tune how the budget is spent using `weights` (relative priority) and `prefetch` (background loading depth).
@@ -101,15 +98,15 @@ config.configure(
 When your catalog is empty (e.g., after `clearImages`), QPane is **blank** by default. You can configure a **Placeholder** to display a helpful landing page or a static logo instead.
 
 Key settings include:
-*   `source`: Path to an image file (or `None` for default text).
-*   `panzoom_enabled`: Allow users to move the placeholder (great for "Drop images here" diagrams).
-*   `zoom_mode`: Control interaction behavior (`fit`, `locked_zoom`, `locked_size`).
-*   `scale_mode`: Control how the image is sized (`PlaceholderScaleMode`).
-    *   `PlaceholderScaleMode.LOGICAL_FIT`: Fits nicely within the widget bounds.
-    *   `PlaceholderScaleMode.PHYSICAL_FIT`: Uses raw device pixels.
-    *   `PlaceholderScaleMode.RELATIVE_FIT`: Scales relative to the window size.
-    *   `PlaceholderScaleMode.AUTO`: The default smart behavior.
-*   `display_size` / `min_display_size`: Enforce size constraints.
+* `source`: Path to an image file (or `None` for default text).
+* `panzoom_enabled`: Allow users to move the placeholder (great for "Drop images here" diagrams).
+* `zoom_mode`: Control interaction behavior (`fit`, `locked_zoom`, `locked_size`).
+* `scale_mode`: Control how the image is sized (`PlaceholderScaleMode`).
+    * `PlaceholderScaleMode.LOGICAL_FIT`: Fits nicely within the widget bounds.
+    * `PlaceholderScaleMode.PHYSICAL_FIT`: Uses raw device pixels.
+    * `PlaceholderScaleMode.RELATIVE_FIT`: Scales relative to the window size.
+    * `PlaceholderScaleMode.AUTO`: The default smart behavior.
+* `display_size` / `min_display_size`: Enforce size constraints.
 
 ```python
 config.configure(
@@ -127,12 +124,12 @@ config.configure(
 Smooth Zoom animates the visual transition between zoom levels without changing the underlying zoom steps. It keeps wheel and double-click navigation feeling snappy while smoothing the motion in between. By default, QPane targets the display refresh rate when available and falls back to a configurable FPS if it cannot detect the monitor.
 
 The key options are:
-*   `smooth_zoom_enabled`: Master switch for animated zoom.
-*   `smooth_zoom_duration_ms`: Duration for normal wheel/double-click transitions.
-*   `smooth_zoom_burst_duration_ms`: Shorter duration used during rapid wheel bursts.
-*   `smooth_zoom_burst_threshold_ms`: How close wheel ticks must be to count as a burst.
-*   `smooth_zoom_use_display_fps`: Prefer the monitor refresh rate when True.
-*   `smooth_zoom_fallback_fps`: The FPS used when display detection is unavailable, or when the display rate is disabled.
+* `smooth_zoom_enabled`: Master switch for animated zoom.
+* `smooth_zoom_duration_ms`: Duration for normal wheel/double-click transitions.
+* `smooth_zoom_burst_duration_ms`: Shorter duration used during rapid wheel bursts.
+* `smooth_zoom_burst_threshold_ms`: How close wheel ticks must be to count as a burst.
+* `smooth_zoom_use_display_fps`: Prefer the monitor refresh rate when True.
+* `smooth_zoom_fallback_fps`: The FPS used when display detection is unavailable, or when the display rate is disabled.
 
 If the selected duration is shorter than a single frame at the chosen FPS, QPane applies the zoom immediately instead of animating. This keeps zoom responsive even with very low FPS targets.
 
@@ -153,10 +150,10 @@ QPane uses a sophisticated background executor to keep the UI responsive. By def
 While the concurrency engine allows fine-grained control (priorities, category limits, device caps), you typically only need to adjust `max_workers` if you are working with truly massive images or running on older hardware where extra threads can help compensate for slower single-core performance.
 
 All keys are optional:
-*   `max_workers`: Global cap on worker threads.
-*   `category_priorities`: Which tasks run first (higher `int` = sooner).
-*   `category_limits`: Max concurrent tasks per category (e.g., limit "sam" to 1).
-*   `device_limits`: Per-device caps (e.g., limit CUDA usage).
+* `max_workers`: Global cap on worker threads.
+* `category_priorities`: Which tasks run first (higher `int` = sooner).
+* `category_limits`: Max concurrent tasks per category (e.g., limit "sam" to 1).
+* `device_limits`: Per-device caps (e.g., limit CUDA usage).
 
 ```python
 concurrency = {
@@ -186,9 +183,9 @@ config.configure(
 If you are building a UI that exposes settings for optional features (like SAM), use `Config.feature_descriptors`. It returns the schema and validators for installed features, allowing you to build dynamic settings pages without hard-coding fields.
 
 ## Related Docs
-*   [Configuration Reference](configuration-reference.md): The complete list of every field and default value.
-*   [Masks and SAM](masks-and-sam.md): Feature-specific settings.
-*   [Diagnostics](diagnostics.md): How to observe runtime behavior.
-*   [Catalog and Navigation](catalog-and-navigation.md): Managing the image list.
+* [Configuration Reference](configuration-reference.md): The complete list of every field and default value.
+* [Masks and SAM](masks-and-sam.md): Feature-specific settings.
+* [Diagnostics](diagnostics.md): How to observe runtime behavior.
+* [Catalog and Navigation](catalog-and-navigation.md): Managing the image list.
 
 **Continue →** [Configuration Reference](configuration-reference.md)

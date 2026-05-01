@@ -27,11 +27,16 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 
+from qpane.catalog.image_catalog import CatalogMutationResult
 from qpane.core import CacheSettings
 from qpane.core.config_features import SamConfigSlice
 from qpane.masks.workflow import MaskActivationSyncResult
 from qpane.rendering import ViewportZoomMode
-from qpane.rendering.tiles import TileIdentifier
+from qpane.scene.identity import (
+    SceneLayerAssetKey,
+    SceneLayerTileKey,
+    default_catalog_asset_key,
+)
 from qpane.swap.coordinator import SwapCoordinator
 
 
@@ -94,6 +99,7 @@ class RecordingSamManager:
     def __init__(self) -> None:
         self.requested: list[uuid.UUID] = []
         self.cancelled: list[uuid.UUID] = []
+        self.removed: list[uuid.UUID] = []
 
     def requestPredictor(
         self, _image: QImage, image_id: uuid.UUID, *, source_path: Path | None
@@ -103,6 +109,9 @@ class RecordingSamManager:
     def cancelPendingPredictor(self, image_id: uuid.UUID) -> bool:
         self.cancelled.append(image_id)
         return True
+
+    def removeFromCache(self, image_id: uuid.UUID) -> None:
+        self.removed.append(image_id)
 
 
 class _SamAwareConfig:
@@ -146,9 +155,9 @@ class StubTileManager:
 
     def __init__(self) -> None:
         self.tileReady = DummySignal()
-        self.prefetch_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
-        self.cancel_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
-        self.removed_ids: list[uuid.UUID] = []
+        self.prefetch_calls: list[tuple[tuple[SceneLayerTileKey, ...], str]] = []
+        self.cancel_calls: list[tuple[tuple[SceneLayerTileKey, ...], str]] = []
+        self.removed_assets: list[SceneLayerAssetKey] = []
         self.cache_limit_bytes = 0
         self.cache_usage_bytes = 0
 
@@ -161,8 +170,11 @@ class StubTileManager:
         batch = tuple(identifiers)
         self.cancel_calls.append((batch, reason))
 
-    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
-        self.removed_ids.append(image_id)
+    def remove_tiles_for_asset(self, asset_key: SceneLayerAssetKey) -> None:
+        self.removed_assets.append(asset_key)
+
+    def remove_tiles_for_source_asset(self, asset_key: SceneLayerAssetKey) -> None:
+        self.removed_assets.append(asset_key)
 
     def calculate_grid_dimensions(self, width: int, height: int) -> tuple[int, int]:
         cols = max(1, width // 64)
@@ -175,23 +187,24 @@ class StubPyramidManager:
 
     def __init__(self) -> None:
         self.pyramidReady = DummySignal()
-        self.prefetch_calls: list[tuple[uuid.UUID, str]] = []
-        self.cancel_calls: list[tuple[tuple[uuid.UUID, ...], str]] = []
+        self.prefetch_calls: list[tuple[SceneLayerAssetKey, str]] = []
+        self.prefetch_payloads: list[tuple[SceneLayerAssetKey, str]] = []
+        self.cancel_calls: list[tuple[tuple[SceneLayerAssetKey, ...], str]] = []
         self.cache_limit_bytes = 0
         self.cache_usage_bytes = 0
 
     def prefetch_pyramid(
         self,
-        image_id: uuid.UUID,
+        asset_key: SceneLayerAssetKey,
         image: QImage,
-        source_path: Path | None,
         reason: str = "prefetch",
     ) -> bool:
-        self.prefetch_calls.append((image_id, reason))
+        self.prefetch_calls.append((asset_key, reason))
+        self.prefetch_payloads.append((asset_key, reason))
         return True
 
-    def cancel_prefetch(self, image_ids, *, reason: str) -> None:
-        batch = tuple(image_ids)
+    def cancel_prefetch(self, asset_keys, *, reason: str) -> None:
+        batch = tuple(asset_keys)
         self.cancel_calls.append((batch, reason))
 
 
@@ -262,6 +275,7 @@ class StubMaskWorkflow:
 class _CatalogEntry:
     image: QImage
     path: Path
+    revision: int = 0
 
 
 class StubCatalog:
@@ -311,24 +325,60 @@ class StubCatalog:
         *,
         image: QImage | None = None,
         path: Path | None = None,
-    ) -> bool:
+    ) -> CatalogMutationResult:
         if self.current_id is None:
-            return False
+            return CatalogMutationResult()
         entry = self._entries[self.current_id]
-        changed = False
+        content_changed = False
+        path_changed = False
         if image is not None and image is not entry.image:
+            old_asset_key = self._asset_key_for_image(self.current_id)
             entry.image = image
-            changed = True
+            entry.revision += 1
+            content_changed = True
+        else:
+            old_asset_key = self._asset_key_for_image(self.current_id)
         if path is not None and path != entry.path:
             self._path_index.pop(entry.path, None)
             entry.path = path
             self._path_index[path] = self.current_id
-            changed = True
-        return changed
+            path_changed = True
+        asset_keys_to_evict = (
+            (old_asset_key,)
+            if old_asset_key is not None and (content_changed or path_changed)
+            else ()
+        )
+        return CatalogMutationResult(
+            content_changed_ids=(self.current_id,) if content_changed else (),
+            path_changed_ids=(self.current_id,) if path_changed else (),
+            cache_asset_keys_to_evict=asset_keys_to_evict,
+        )
 
-    def getBestFitImage(self, image_id: uuid.UUID, target_width: int) -> QImage | None:
+    def getRevision(self, image_id: uuid.UUID) -> int | None:
         entry = self._entries.get(image_id)
+        return None if entry is None else entry.revision
+
+    def getBestFitImageForAsset(
+        self, asset_key: SceneLayerAssetKey | None, target_width: int
+    ) -> QImage | None:
+        if asset_key is None:
+            return None
+        entry = self._entries.get(asset_key.source_id)
         return None if entry is None else entry.image
+
+    def _asset_key_for_image(
+        self, image_id: uuid.UUID | None
+    ) -> SceneLayerAssetKey | None:
+        if image_id is None:
+            return None
+        entry = self._entries.get(image_id)
+        if entry is None:
+            return None
+        return default_catalog_asset_key(
+            image_id,
+            revision=entry.revision,
+            source_path=entry.path,
+        )
 
     def exitPlaceholderMode(self) -> None:
         return
@@ -547,17 +597,34 @@ def test_apply_image_emits_loaded_and_fits_view(harness):
     assert harness.qpane.original_image is image
 
 
+def test_apply_image_evicts_tile_and_sam_cache_for_changed_current_image(harness):
+    image_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    harness.catalog.setCurrentImageID(image_id)
+    sam_manager = RecordingSamManager()
+    harness.coordinator.on_sam_manager_attached(sam_manager)
+    replacement = _solid_image(Qt.blue)
+    harness.coordinator.apply_image(
+        replacement,
+        Path("first.png"),
+        image_id=image_id,
+        fit_view=False,
+    )
+    assert [key.source_id for key in harness.tile_manager.removed_assets] == [image_id]
+    assert sam_manager.removed == [image_id]
+    assert harness.qpane.original_image is replacement
+
+
 def test_prefetch_neighbors_tracks_tiles_and_pyramids(harness):
     first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
     harness.add_image(color=Qt.blue, path=Path("second.png"))
     harness.add_image(color=Qt.green, path=Path("third.png"))
     harness.set_current_image(first_id)
     coordinator = harness.coordinator
-    scheduled_pyramids: list[uuid.UUID] = []
-    scheduled_tiles: list[list[TileIdentifier]] = []
+    scheduled_pyramids: list[SceneLayerAssetKey] = []
+    scheduled_tiles: list[list[SceneLayerTileKey]] = []
 
-    def fake_prefetch_pyramid(image_id, image, source_path, reason="prefetch"):
-        scheduled_pyramids.append(image_id)
+    def fake_prefetch_pyramid(asset_key, image, reason="prefetch"):
+        scheduled_pyramids.append(asset_key)
         return True
 
     def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
@@ -584,12 +651,44 @@ def test_prefetch_neighbors_tracks_tiles_and_pyramids(harness):
     assert metrics_after.pending_tile_prefetch == 0
 
 
+def test_prefetch_neighbors_uses_neighbor_image_ids_and_paths(harness):
+    cache_settings = CacheSettings()
+    cache_settings.prefetch.pyramids = 1
+    cache_settings.prefetch.tiles = 1
+    cache_settings.prefetch.tiles_per_neighbor = 2
+    harness.coordinator.apply_config(SimpleNamespace(cache=cache_settings))
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    second_id = harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.set_current_image(first_id)
+    harness.catalog.pyramid_manager.prefetch_calls.clear()
+    harness.catalog.pyramid_manager.prefetch_payloads.clear()
+    harness.tile_manager.prefetch_calls.clear()
+    harness.coordinator._pending_pyramid_ids.clear()
+    harness.coordinator._pyramid_prefetch_recent.clear()
+    harness.coordinator._pending_tile_prefetch_ids.clear()
+    harness.coordinator.prefetch_neighbors(first_id)
+    assert len(harness.catalog.pyramid_manager.prefetch_payloads) == 1
+    asset_key, reason = harness.catalog.pyramid_manager.prefetch_payloads[0]
+    assert asset_key.source_id == second_id
+    assert asset_key.source_path == Path("second.png")
+    assert reason == "neighbor"
+    assert harness.tile_manager.prefetch_calls
+    tile_batch, reason = harness.tile_manager.prefetch_calls[-1]
+    assert reason == "neighbor"
+    assert tile_batch
+    assert all(identifier.asset_key.source_id == second_id for identifier in tile_batch)
+    assert all(
+        identifier.asset_key.source_path == Path("second.png")
+        for identifier in tile_batch
+    )
+
+
 def test_prefetch_tiles_depth_zero_disables_prefetch(harness):
     first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
     harness.add_image(color=Qt.blue, path=Path("second.png"))
     harness.set_current_image(first_id)
     coordinator = harness.coordinator
-    calls: list[list[TileIdentifier]] = []
+    calls: list[list[SceneLayerTileKey]] = []
 
     def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
         batch = list(identifiers)
@@ -617,7 +716,7 @@ def test_prefetch_tiles_respects_tiles_per_neighbor(harness):
     cache_settings.prefetch.tiles = 2
     cache_settings.prefetch.tiles_per_neighbor = 2
     coordinator.apply_config(SimpleNamespace(cache=cache_settings))
-    scheduled_tiles: list[list[TileIdentifier]] = []
+    scheduled_tiles: list[list[SceneLayerTileKey]] = []
 
     def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
         batch = list(identifiers)
@@ -636,10 +735,10 @@ def test_prefetch_pyramids_skips_recent_duplicates(harness, monkeypatch):
     first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
     harness.add_image(color=Qt.blue, path=Path("second.png"))
     manager = harness.catalog.pyramid_manager
-    calls: list[uuid.UUID] = []
+    calls: list[SceneLayerAssetKey] = []
 
-    def fake_prefetch(image_id, image, source_path, reason="prefetch"):
-        calls.append(image_id)
+    def fake_prefetch(asset_key, image, reason="prefetch"):
+        calls.append(asset_key)
         return True
 
     manager.prefetch_pyramid = fake_prefetch
@@ -675,7 +774,7 @@ def test_prefetch_pyramids_skips_recent_duplicates(harness, monkeypatch):
     clock["value"] += 2.0
     swap_coordinator.prefetch_neighbors(first_id)
     assert len(calls) > baseline
-    scheduled_tiles: list[list[TileIdentifier]] = []
+    scheduled_tiles: list[list[SceneLayerTileKey]] = []
 
     def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
         batch = list(identifiers)

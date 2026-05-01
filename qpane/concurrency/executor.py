@@ -768,10 +768,10 @@ class QThreadPoolExecutor(TaskExecutorProtocol):
         return alive
 
     def _log_pool_unavailable_once(self) -> None:
-        """Warn once when the pool is unavailable and tasks are dropped."""
+        """Log once when the pool is unavailable and tasks are dropped."""
         if self._pool_unavailable_logged:
             return
-        logger.warning(
+        logger.debug(
             "Executor %s thread pool is unavailable; dropping queued work",
             self._name,
         )

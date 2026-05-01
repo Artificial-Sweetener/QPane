@@ -17,7 +17,8 @@
 """Exercises string semantics for enums previously backed by StrEnum."""
 
 import json
-from qpane.rendering import PyramidStatus, RenderStrategy, ViewportZoomMode
+from qpane.rendering import PyramidStatus, ViewportZoomMode
+from qpane.scene.render_plan import RenderStrategy
 
 
 def test_render_strategy_behaves_like_string() -> None:

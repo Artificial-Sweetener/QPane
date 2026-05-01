@@ -39,13 +39,17 @@ def test_demo_catalog_clicks_drive_tool_focus(qapp) -> None:
         image_id = uuid.uuid4()
         image_map = QPane.imageMapFromLists([_solid_image()], [None], [image_id])
         window.qpane.setImagesByID(image_map, current_id=image_id)
-        mask_id = window.qpane.createBlankMask(window.qpane.currentImage.size())
+        image = window.qpane.currentImage
+        assert image is not None
+        mask_id = window.qpane.createBlankMask(image.size())
         assert mask_id is not None
         window.qpane.setActiveMaskID(mask_id)
         window.qpane.setCurrentImageID(None)
         qapp.processEvents()
 
         assert window.catalog_dock is not None
+        window.catalog_dock._catalog_action.setChecked(True)
+        qapp.processEvents()
 
         def _items():
             """Return the current catalog tree items after refreshes."""

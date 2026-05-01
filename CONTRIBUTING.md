@@ -48,10 +48,12 @@ The `QPane` widget acts as a **Facade**, delegating all logic to specialized sub
 ### The Subsystems
 
 - **Catalog (`qpane/catalog/`)**: Host-facing facade and data model for images, paths, and navigation. [`Catalog`](docs/catalog-and-navigation.md) sequences host mutations; `CatalogController` and `ImageCatalog` perform the underlying cache/pyramid updates and navigation bookkeeping.
-- **Rendering (`qpane/rendering/`)**: `RenderingPresenter` owns the draw pipeline, while `Viewport` owns pan/zoom state and transforms. Use these collaborators for coordinate conversions and render state.
+- **Scene (`qpane/scene/`)**: Internal scene and layer descriptors, typed layer sources, placement, hit-test metadata, scene/layer identity, provider/resolver contracts, internal scene mutation routing, private multi-image layout state, scene-layer selection state, and future render-plan snapshots.
+- **Rendering (`qpane/rendering/`)**: `RenderingPresenter` owns the draw pipeline and render-work planning, while `Viewport` owns pan/zoom state and transforms. Visibility planning owns layer-visible source geometry used to cull tile work before painting.
 - **Tools (`qpane/tools/`)**: `ToolInteractionDelegate` handles widget input and cursor/overlay plumbing. [Tool logic](docs/extensibility.md) lives in isolated Tool classes that activate with injected `ToolDependencies`.
 - **Masks (`qpane/masks/`)**: [`MaskService`](docs/masks-and-sam.md) is the domain facade, coordinating mask operations, async work, autosave, and undo integration.
 - **SAM (`qpane/sam/`)**: MobileSAM lifecycle and predictor management. `SamManager` handles background predictor preparation; inference is invoked via `qpane/sam/service.py` by the mask workflow.
+- **Compare (`qpane/compare/`)**: Catalog-backed comparison workflow state, split settings, source revisions, and compare scene contributions.
 - **Swap (`qpane/swap/`)**: Navigation/prefetch orchestration for pyramids, tiles, masks, and SAM predictors. `SwapCoordinator` tracks pending work and `SwapDelegate` bridges QPane callbacks.
 
 ### UI Components (`qpane/ui/`)

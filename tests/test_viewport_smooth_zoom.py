@@ -22,7 +22,7 @@ from PySide6.QtCore import QPointF, QRectF, QSize
 from PySide6.QtWidgets import QWidget
 
 from qpane.core import Config
-from qpane.rendering.viewport import Viewport
+from qpane.rendering.viewport import Viewport, ViewportZoomMode
 
 from PySide6.QtGui import QImage
 
@@ -150,6 +150,88 @@ def test_smooth_zoom_clamping(viewport_setup):
 
         assert viewport.zoom == 2.0
         assert viewport._zoom_anim_pending is False
+
+
+def test_smooth_zoom_completion_commits_exact_target_zoom(viewport_setup):
+    """Completed animations should land on the requested target zoom exactly."""
+    viewport, _ = viewport_setup
+    target_zoom = 0.2887369791666667
+    viewport.zoom = 1.0
+    viewport.pan = QPointF(12, -8)
+
+    with patch("qpane.rendering.viewport.time") as mock_time:
+        mock_elapsed = MagicMock()
+        viewport._zoom_anim_elapsed = mock_elapsed
+        mock_time.monotonic.return_value = 1000.0
+
+        viewport._start_zoom_animation(
+            target_zoom=target_zoom,
+            anchor=None,
+            duration_ms=80,
+            min_frame_ms=16,
+            target_pan=QPointF(0, 0),
+        )
+
+        mock_time.monotonic.return_value = 1000.081
+        mock_elapsed.elapsed.return_value = 81
+
+        viewport._tick_zoom_animation()
+
+    assert viewport.zoom == target_zoom
+    assert viewport._zoom_anim_pending is False
+
+
+def test_fit_zoom_completion_commits_exact_target_pan(viewport_setup):
+    """Completed fit animations should recenter pan exactly."""
+    viewport, _ = viewport_setup
+    target_zoom = 0.6
+    viewport.zoom = 1.0
+    viewport.pan = QPointF(48, -32)
+
+    with patch("qpane.rendering.viewport.time") as mock_time:
+        mock_elapsed = MagicMock()
+        viewport._zoom_anim_elapsed = mock_elapsed
+        mock_time.monotonic.return_value = 1000.0
+
+        viewport._apply_zoom_interpolated(
+            requested_zoom=target_zoom,
+            anchor=None,
+            target_mode=ViewportZoomMode.FIT,
+            request_delta_ms=None,
+            target_pan=QPointF(0, 0),
+            fit_zoom=target_zoom,
+        )
+
+        mock_time.monotonic.return_value = 1000.081
+        mock_elapsed.elapsed.return_value = 81
+
+        viewport._tick_zoom_animation()
+
+    assert viewport.zoom == target_zoom
+    assert viewport.pan == QPointF(0, 0)
+    assert viewport.get_zoom_mode() == viewport.zoom_mode.FIT
+
+
+def test_anchored_one_to_one_completion_uses_exact_native_zoom(viewport_setup):
+    """Completed anchored 1:1 animations should land on native zoom exactly."""
+    viewport, _ = viewport_setup
+    viewport.zoom = 0.5
+    viewport.pan = QPointF(0, 0)
+
+    with patch("qpane.rendering.viewport.time") as mock_time:
+        mock_elapsed = MagicMock()
+        viewport._zoom_anim_elapsed = mock_elapsed
+        mock_time.monotonic.return_value = 1000.0
+
+        viewport.setZoom1To1Interpolated(anchor=QPointF(120, 160))
+
+        mock_time.monotonic.return_value = 1000.081
+        mock_elapsed.elapsed.return_value = 81
+
+        viewport._tick_zoom_animation()
+
+    assert viewport.zoom == viewport.nativeZoom()
+    assert viewport._zoom_anim_pending is False
 
 
 def test_smooth_zoom_frame_skipping(viewport_setup):

@@ -48,17 +48,69 @@ def test_remove_images_by_id_batches_evictions_and_display(monkeypatch, qpane_vi
         lambda *, fit_view=True: display_calls.append(fit_view),
     )
     evictions: list[tuple[uuid.UUID, ...]] = []
+    sam_evictions: list[tuple[uuid.UUID, ...]] = []
     monkeypatch.setattr(
         controller,
-        "_evict_images",
-        lambda image_ids: evictions.append(tuple(image_ids)),
+        "_evict_catalog_assets",
+        lambda asset_keys: evictions.append(
+            tuple(asset_key.source_id for asset_key in asset_keys)
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_evict_sam_images",
+        lambda image_ids: sam_evictions.append(tuple(image_ids)),
     )
     removed = controller.removeImagesByID([second, first, second])
     assert removed == (second, first)
     assert display_calls == [True]
     assert len(evictions) == 1
     assert set(evictions[0]) == {first, second}
+    assert len(sam_evictions) == 1
+    assert set(sam_evictions[0]) == {first, second}
     assert controller.catalog.getImageIds() == [third]
+
+
+def test_set_images_by_id_evicts_removed_and_changed_ids(monkeypatch, qpane_view):
+    controller = qpane_view.catalog_controller
+    unchanged = uuid.uuid4()
+    changed = uuid.uuid4()
+    removed = uuid.uuid4()
+    controller.setImagesByID(
+        {
+            unchanged: CatalogEntry(image=_solid_image(Qt.red), path=Path("a.png")),
+            changed: CatalogEntry(image=_solid_image(Qt.green), path=Path("b.png")),
+            removed: CatalogEntry(image=_solid_image(Qt.blue), path=Path("c.png")),
+        },
+        unchanged,
+        display=False,
+    )
+    asset_evictions: list[tuple[uuid.UUID, ...]] = []
+    sam_evictions: list[tuple[uuid.UUID, ...]] = []
+    monkeypatch.setattr(
+        controller,
+        "_evict_catalog_assets",
+        lambda asset_keys: asset_evictions.append(
+            tuple(asset_key.source_id for asset_key in asset_keys)
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_evict_sam_images",
+        lambda image_ids: sam_evictions.append(tuple(image_ids)),
+    )
+    controller.setImagesByID(
+        {
+            unchanged: CatalogEntry(image=_solid_image(Qt.red), path=Path("a2.png")),
+            changed: CatalogEntry(image=_solid_image(Qt.white), path=Path("b.png")),
+        },
+        changed,
+        display=False,
+    )
+    assert len(asset_evictions) == 1
+    assert set(asset_evictions[0]) == {unchanged, changed, removed}
+    assert len(sam_evictions) == 1
+    assert set(sam_evictions[0]) == {changed, removed}
 
 
 def test_restore_view_state_preserves_pan_in_1to1_mode(qpane_view):

@@ -17,15 +17,15 @@
 from __future__ import annotations
 import types
 import pytest
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize
+from PySide6.QtCore import QPointF, QRect, QSize
 from PySide6.QtGui import (
     QImage,
     QPainter,
     QRegion,
     Qt,
-    QTransform,
 )
-from qpane.rendering import Renderer, RenderState, RenderStrategy
+from qpane.rendering import Renderer
+from tests.helpers.render_plan import make_render_plan
 
 
 class _StubQPane:
@@ -46,26 +46,15 @@ class _StubQPane:
         return self._view
 
 
-def _make_state(qpane_rect: QRect, *, render_hint_enabled: bool) -> RenderState:
+def _make_plan(qpane_rect: QRect, *, render_hint_enabled: bool):
+    """Build a one-layer render plan with the requested hint setting."""
     source_image = QImage(qpane_rect.size(), QImage.Format_ARGB32_Premultiplied)
     source_image.fill(Qt.white)
-    return RenderState(
+    return make_render_plan(
+        qpane_rect,
         source_image=source_image,
-        pyramid_scale=1.0,
-        transform=QTransform(),
-        zoom=1.0,
-        strategy=RenderStrategy.DIRECT,
         render_hint_enabled=render_hint_enabled,
-        debug_draw_tile_grid=False,
-        tiles_to_draw=[],
-        tile_size=64,
-        tile_overlap=0,
-        max_tile_cols=1,
-        max_tile_rows=1,
-        qpane_rect=qpane_rect,
         current_pan=QPointF(0.0, 0.0),
-        physical_viewport_rect=QRectF(qpane_rect),
-        visible_tile_range=None,
     )
 
 
@@ -80,7 +69,7 @@ def test_redraw_base_image_buffer_toggles_render_hint(
         qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
     )
     renderer._base_image_buffer.fill(Qt.transparent)
-    state = _make_state(qpane_rect, render_hint_enabled=render_hint_enabled)
+    plan = _make_plan(qpane_rect, render_hint_enabled=render_hint_enabled)
     dirty_region = QRegion(qpane_rect)
     calls = []
     original = QPainter.setRenderHint
@@ -91,7 +80,7 @@ def test_redraw_base_image_buffer_toggles_render_hint(
         return original(self, hint, on)
 
     monkeypatch.setattr(QPainter, "setRenderHint", fake_set_render_hint, raising=False)
-    renderer._redraw_base_image_buffer(dirty_region, state)
+    renderer._redraw_base_image_buffer(dirty_region, plan)
     assert len(calls) == expected_calls
 
 
@@ -106,7 +95,7 @@ def test_repair_base_buffer_strips_toggles_render_hint(
         qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
     )
     renderer._base_image_buffer.fill(Qt.transparent)
-    state = _make_state(qpane_rect, render_hint_enabled=render_hint_enabled)
+    plan = _make_plan(qpane_rect, render_hint_enabled=render_hint_enabled)
     repair_rects = [QRect(0, 0, 10, 10)]
     calls = []
     original = QPainter.setRenderHint
@@ -117,5 +106,5 @@ def test_repair_base_buffer_strips_toggles_render_hint(
         return original(self, hint, on)
 
     monkeypatch.setattr(QPainter, "setRenderHint", fake_set_render_hint, raising=False)
-    renderer._repair_base_buffer_strips(repair_rects, state)
+    renderer._repair_base_buffer_strips(repair_rects, plan)
     assert len(calls) == expected_calls

@@ -29,10 +29,10 @@ from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 
 from ..core.config import PlaceholderSettings
 from ..rendering import CoordinateContext, NormalizedViewState, ViewportZoomMode
+from ..scene.identity import SceneLayerAssetKey
 from ..tools import Tools
 from ..ui import copyToClipboard, drag_out_image
 from .image_map import ImageMap
-from .image_utils import images_differ
 from ..types import LinkedGroup
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -62,6 +62,15 @@ class PlaceholderDisplayOptions:
     min_display_size: QSize | None
     max_display_size: QSize | None
     scale_factor: float
+
+
+@dataclass(frozen=True)
+class PlaceholderContent:
+    """Catalog-owned placeholder pixels and metadata for internal rendering."""
+
+    image: QImage
+    source_path: Path | None
+    revision: int = 0
 
 
 class CatalogController:
@@ -113,11 +122,11 @@ class CatalogController:
             Evicts tile/SAM caches for removed or changed paths and optionally
             triggers rendering of the new current image.
         """
-        removed_ids, changed_ids = self.catalog.setImagesByID(image_map, current_id)
-        if removed_ids:
-            self._evict_images(removed_ids)
-        if changed_ids:
-            self._evict_images(changed_ids)
+        mutation = self.catalog.setImagesByID(image_map, current_id)
+        self._evict_catalog_assets(mutation.cache_asset_keys_to_evict)
+        self._evict_sam_images(
+            tuple(dict.fromkeys(mutation.removed_ids + mutation.content_changed_ids))
+        )
         if display:
             self._display_current_catalog_image()
 
@@ -139,10 +148,9 @@ class CatalogController:
         if image.isNull():
             logger.error("addImage called with null QImage for %s", image_id)
             raise ValueError("image must not be null")
-        old_image = self.catalog.getImage(image_id)
-        self.catalog.addImage(image_id, image, path)
-        if images_differ(old_image, image):
-            self._evict_images((image_id,))
+        mutation = self.catalog.addImage(image_id, image, path)
+        self._evict_catalog_assets(mutation.cache_asset_keys_to_evict)
+        self._evict_sam_images(mutation.content_changed_ids)
 
     def removeImageByID(self, image_id: uuid.UUID) -> None:
         """Remove a single image and clean up dependent caches.
@@ -451,13 +459,37 @@ class CatalogController:
             if policy is None or not getattr(policy, "drag_out_enabled", False):
                 logger.info("Drag-out suppressed while placeholder is active")
                 return
-        drag_out_image(self._qpane, event)
+            placeholder = self.placeholder_content()
+            if placeholder is None:
+                return
+            drag_out_image(
+                self._qpane,
+                event,
+                image=placeholder.image,
+                path=placeholder.source_path,
+            )
+            return
+        drag_out_image(
+            self._qpane,
+            event,
+            image=self.catalog.getCurrentImage(),
+            path=self.catalog.getCurrentPath(),
+        )
 
     def copyCurrentImageToClipboard(self) -> bool:
-        """Copy the currently displayed image to the system clipboard."""
+        """Copy the current base catalog or placeholder image to the system clipboard."""
         image_path = self.catalog.getCurrentPath()
+        image = self.catalog.getCurrentImage()
+        if image is None or image.isNull():
+            placeholder = self.placeholder_content()
+            if placeholder is not None:
+                image = placeholder.image
+                image_path = placeholder.source_path
+        if image is None or image.isNull():
+            logger.warning("Clipboard copy skipped because no base image is available")
+            return False
         try:
-            copied = copyToClipboard(QPixmap.fromImage(self._qpane.original_image))
+            copied = copyToClipboard(QPixmap.fromImage(image))
         except RuntimeError as exc:
             logger.error(
                 "Clipboard copy failed for %s: %s",
@@ -507,7 +539,7 @@ class CatalogController:
         self._qpane.original_image = placeholder
         fit_view = policy.zoom_mode == "fit"
         self._swap_delegate.apply_image(
-            self._qpane.original_image,
+            placeholder,
             source_path=policy.source,
             image_id=None,
             fit_view=fit_view,
@@ -655,6 +687,20 @@ class CatalogController:
         """Return the sanitized placeholder policy from configuration."""
         return self._placeholder_policy
 
+    def placeholder_content(self) -> PlaceholderContent | None:
+        """Return renderable placeholder content while placeholder mode is active."""
+        if not self._placeholder_active:
+            return None
+        placeholder = self._placeholder_image
+        policy = self._placeholder_policy
+        if placeholder is None or placeholder.isNull() or policy is None:
+            return None
+        return PlaceholderContent(
+            image=placeholder,
+            source_path=policy.source,
+            revision=0,
+        )
+
     def enter_placeholder_mode(self) -> None:
         """Apply interaction locks defined by the placeholder policy."""
         policy = self._placeholder_policy
@@ -745,17 +791,29 @@ class CatalogController:
         self._viewport.zoom_mode = ViewportZoomMode.CUSTOM
         self._viewport.setZoomAndPan(zoom, QPointF(pan_x, pan_y))
 
-    def _evict_images(self, image_ids: Iterable[uuid.UUID]) -> None:
-        """Purge tile and SAM caches for the provided image IDs.
+    def _evict_catalog_assets(self, asset_keys: Iterable[SceneLayerAssetKey]) -> None:
+        """Purge tile caches for the provided catalog source asset keys.
 
         Args:
-            image_ids: IDs to drop from tile and SAM caches.
+            asset_keys: Source identities to drop from tile caches.
         """
+        for asset_key in asset_keys:
+            self._tile_manager.remove_tiles_for_source_asset(asset_key)
+
+    def _evict_sam_images(self, image_ids: Iterable[uuid.UUID]) -> None:
+        """Purge SAM caches for the provided catalog image IDs."""
         sam_manager = self._sam_manager
+        if sam_manager is None:
+            return
         for image_id in image_ids:
-            self._tile_manager.remove_tiles_for_image_id(image_id)
-            if sam_manager is not None:
-                sam_manager.removeFromCache(image_id)
+            sam_manager.removeFromCache(image_id)
+
+    def _asset_key_for_image(self, image_id: uuid.UUID) -> SceneLayerAssetKey | None:
+        """Return the current default-scene asset key for ``image_id``."""
+        getter = getattr(self.catalog, "defaultAssetKeyForImage", None)
+        if not callable(getter):
+            return None
+        return getter(image_id)
 
     def _remove_images(
         self, image_ids: Iterable[uuid.UUID], *, log_context: str
@@ -764,20 +822,22 @@ class CatalogController:
         ordered_ids = tuple(dict.fromkeys(image_ids))
         removed: list[uuid.UUID] = []
         ids_to_evict: set[uuid.UUID] = set()
+        asset_keys_to_evict: list[SceneLayerAssetKey] = []
         mask_service = self._mask_service
         for image_id in ordered_ids:
             if not self.catalog.containsImage(image_id):
                 continue
             removed.append(image_id)
             ids_to_evict.add(image_id)
+            asset_key = self._asset_key_for_image(image_id)
+            if asset_key is not None:
+                asset_keys_to_evict.append(asset_key)
             if mask_service is not None:
                 mask_service.invalidateMaskCachesForImage(image_id)
             self.catalog.removeImageByID(image_id)
             self.link_manager.handleImageRemoved(image_id)
         if not removed:
             return tuple()
-        if ids_to_evict:
-            self._evict_images(ids_to_evict)
         if not self.catalog.hasImages():
             logger.info(
                 "Catalog empty after %s; clearing images and using placeholder",
@@ -785,6 +845,8 @@ class CatalogController:
             )
             self.clearImages()
         else:
+            self._evict_catalog_assets(asset_keys_to_evict)
+            self._evict_sam_images(ids_to_evict)
             self._display_current_catalog_image()
         return tuple(removed)
 

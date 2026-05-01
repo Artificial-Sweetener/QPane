@@ -27,6 +27,7 @@ from PySide6.QtGui import QTransform
 
 if TYPE_CHECKING:
     from ..qpane import QPane
+    from ..scene.render_plan import SceneContentSnapshot
     from .viewport import ViewportZoomMode
 logger = logging.getLogger(__name__)
 
@@ -210,7 +211,12 @@ class CoordinateContext:
     _ZOOM_EPSILON = 1e-6
     _MIN_DPR = 1e-6
 
-    def __init__(self, qpane: "QPane", pan_override: Optional[QPointF] = None):
+    def __init__(
+        self,
+        qpane: "QPane",
+        pan_override: Optional[QPointF] = None,
+        content_snapshot: "SceneContentSnapshot | None" = None,
+    ):
         """Snapshot DPR, image geometry, and viewport pan/zoom for conversions."""
         raw_dpr = float(qpane.devicePixelRatioF())
         if raw_dpr <= self._MIN_DPR:
@@ -219,7 +225,6 @@ class CoordinateContext:
             )
             raw_dpr = 1.0
         self.dpr = raw_dpr
-        self._image_ready = not qpane.original_image.isNull()
         try:
             view = qpane.view()
         except AttributeError as exc:
@@ -232,7 +237,13 @@ class CoordinateContext:
         )
         self.qpane_size_logical = LogicalSize.from_qt(qpane.size())
         self._qpane_center_logical = self.qpane_size_logical.half_point()
-        self.image_size = PhysicalSize.from_qt(qpane.original_image.size())
+        self._image_ready = content_snapshot is not None
+        base_image_size = (
+            content_snapshot.base_image_size
+            if content_snapshot is not None
+            else QSize()
+        )
+        self.image_size = PhysicalSize.from_qt(base_image_size)
         if self._image_ready:
             self._image_center = PhysicalPoint(
                 self.image_size.width / 2.0,
@@ -242,15 +253,15 @@ class CoordinateContext:
             # Image-dependent helpers must refuse to run until an image is loaded.
             self._image_center = PhysicalPoint(0.0, 0.0)
             logger.debug(
-                "CoordinateContext initialised without an original image; only DPR"
+                "CoordinateContext initialised without content geometry; only DPR"
                 " helpers are available."
             )
 
     def _require_image(self) -> None:
-        """Ensure original_image is valid before running image-space math."""
+        """Ensure content geometry is valid before running image-space math."""
         if not self._image_ready:
             raise ValueError(
-                "Coordinate conversions require a non-null original_image."
+                "Coordinate conversions require renderable content geometry."
             )
 
     def _safe_zoom(self) -> float:

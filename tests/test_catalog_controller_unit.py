@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6.QtCore import QPointF, QSize
@@ -26,6 +27,7 @@ from PySide6.QtGui import QImage
 
 from qpane.catalog.controller import CatalogController
 from qpane.rendering import NormalizedViewState, ViewportZoomMode
+from qpane.scene.identity import SceneLayerAssetKey, default_catalog_asset_key
 
 
 class _ViewportStub:
@@ -83,6 +85,14 @@ class _CatalogStub:
     def getPath(self, image_id: uuid.UUID):
         return self._paths.get(image_id)
 
+    def defaultAssetKeyForImage(self, image_id: uuid.UUID) -> SceneLayerAssetKey | None:
+        path = self.getPath(image_id)
+        return default_catalog_asset_key(
+            image_id,
+            revision=0,
+            source_path=Path(path) if path is not None else None,
+        )
+
     def removeImageByID(self, image_id: uuid.UUID) -> None:
         self._paths.pop(image_id, None)
         if image_id in self._image_ids:
@@ -105,11 +115,14 @@ class _TileManagerStub:
     """Track cache removals triggered by catalog mutations."""
 
     def __init__(self) -> None:
-        self.removed: list[uuid.UUID] = []
+        self.removed: list[SceneLayerAssetKey] = []
         self.cleared = False
 
-    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
-        self.removed.append(image_id)
+    def remove_tiles_for_asset(self, asset_key: SceneLayerAssetKey) -> None:
+        self.removed.append(asset_key)
+
+    def remove_tiles_for_source_asset(self, asset_key: SceneLayerAssetKey) -> None:
+        self.removed.append(asset_key)
 
     def clear_caches(self) -> None:
         self.cleared = True
@@ -311,7 +324,7 @@ def test_remove_images_evicts_mask_and_sam_caches() -> None:
     removed = controller.removeImagesByID((image_id,))
     assert removed == (image_id,)
     assert mask_calls == [image_id]
-    assert tile_manager.removed == [image_id]
+    assert [key.source_id for key in tile_manager.removed] == [image_id]
     assert sam_calls == [image_id]
     assert link_manager.removed == [image_id]
     assert controller._swap_delegate.display_calls == 1

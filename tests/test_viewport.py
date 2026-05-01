@@ -17,7 +17,7 @@
 import pytest
 from PySide6.QtCore import QPointF, QRectF, QSize, QSizeF
 from qpane import Config
-from qpane.rendering import Viewport
+from qpane.rendering import Viewport, ViewportZoomMode
 
 
 class DummyViewportHost:
@@ -95,3 +95,57 @@ def test_pan_and_zoom_mutators_respect_lock_state():
     viewport.setZoom1To1()
     assert viewport.zoom == pytest.approx(0.5)
     assert viewport.pan == QPointF(10, 12)
+
+
+def test_fit_mode_rejects_pan_after_near_exact_fit():
+    viewport, _ = _make_viewport(
+        qpane_size=(593, 887),
+        dpr=1.0,
+        content_size=(2048, 3072),
+        zoom=0.28873697916666674,
+    )
+    viewport.zoom_mode = ViewportZoomMode.FIT
+    viewport.fit_zoom = 887 / 3072
+
+    assert viewport.can_pan() is False
+
+    viewport.setPan(QPointF(0, 50))
+
+    assert viewport.pan == QPointF(0, 0)
+
+
+def test_clamp_pan_treats_near_zero_overflow_as_fitting():
+    viewport, _ = _make_viewport(
+        qpane_size=(593, 887),
+        dpr=1.0,
+        content_size=(2048, 3072),
+        zoom=0.28873697916666674,
+    )
+    clamped = viewport.clampPan(
+        QPointF(0, 50),
+        0.28873697916666674,
+        QSizeF(593, 887),
+        QSize(2048, 3072),
+    )
+
+    assert clamped == QPointF(0, 0)
+
+
+def test_custom_mode_allows_pan_with_meaningful_overflow():
+    viewport, _ = _make_viewport(
+        qpane_size=(593, 887),
+        dpr=1.0,
+        content_size=(2048, 3072),
+        zoom=0.5,
+    )
+    viewport.zoom_mode = ViewportZoomMode.CUSTOM
+
+    assert viewport.can_pan() is True
+
+    clamped = viewport.clampPan(
+        QPointF(20, 30),
+        viewport.zoom,
+        QSizeF(593, 887),
+        viewport.content_size,
+    )
+    assert clamped == QPointF(20, 30)

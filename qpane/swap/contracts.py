@@ -30,7 +30,7 @@ from typing import Protocol, Sequence, runtime_checkable
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QImage
 
-from ..rendering import TileIdentifier
+from ..scene.identity import SceneLayerAssetKey, SceneLayerTileKey
 
 
 @runtime_checkable
@@ -43,22 +43,28 @@ class TilePrefetchManager(Protocol):
 
     def prefetch_tiles(
         self,
-        identifiers: Sequence[TileIdentifier],
+        identifiers: Sequence[SceneLayerTileKey],
         source_image: QImage,
         *,
         reason: str = "neighbor",
-    ) -> Sequence[TileIdentifier]:
+    ) -> Sequence[SceneLayerTileKey]:
         """Queue tile generation for ``identifiers`` using ``source_image``."""
         ...
 
     def cancel_prefetch(
-        self, identifiers: Sequence[TileIdentifier], *, reason: str
+        self, identifiers: Sequence[SceneLayerTileKey], *, reason: str
     ) -> None:
         """Request cancellation for prefetches associated with ``identifiers``."""
         ...
 
-    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
-        """Drop cached tiles and inflight work for ``image_id``."""
+    def remove_tiles_for_asset(self, asset_key: SceneLayerAssetKey) -> None:
+        """Drop cached tiles and inflight work for ``asset_key``."""
+        ...
+
+    def remove_tiles_for_source_asset(
+        self, pyramid_asset_key: SceneLayerAssetKey
+    ) -> None:
+        """Drop cached tiles and inflight work for ``pyramid_asset_key``."""
         ...
 
     def calculate_grid_dimensions(self, width: int, height: int) -> tuple[int, int]:
@@ -76,19 +82,18 @@ class PyramidPrefetchManager(Protocol):
 
     def prefetch_pyramid(
         self,
-        image_id: uuid.UUID,
+        asset_key: SceneLayerAssetKey,
         image: QImage,
-        source_path: Path | None,
         *,
         reason: str = "prefetch",
     ) -> bool:
-        """Begin background pyramid generation for ``image_id`` when missing."""
+        """Begin background pyramid generation for ``asset_key`` when missing."""
         ...
 
     def cancel_prefetch(
-        self, image_ids: Sequence[uuid.UUID], *, reason: str = "navigation"
-    ) -> Sequence[uuid.UUID]:
-        """Cancel pyramid prefetch for ``image_ids`` and return the cancelled set."""
+        self, asset_keys: Sequence[SceneLayerAssetKey], *, reason: str = "navigation"
+    ) -> Sequence[SceneLayerAssetKey]:
+        """Cancel pyramid prefetch for ``asset_keys`` and return cancelled keys."""
         ...
 
 
@@ -114,7 +119,7 @@ class MaskPrefetchService(Protocol):
         reason: str = "navigation",
         scales: Sequence[float] | None = None,
     ) -> bool:
-        """Warm colorized mask overlays for ``image_id`` on a background executor."""
+        """Warm colorized mask renders for ``image_id`` on a background executor."""
         ...
 
     def cancelPrefetch(self, image_id: uuid.UUID | None) -> bool:

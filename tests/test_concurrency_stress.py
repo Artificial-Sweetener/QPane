@@ -26,7 +26,6 @@ import pytest
 from PySide6.QtCore import QRunnable
 from PySide6.QtGui import QColor, QImage
 from qpane import Config, sam
-from qpane.rendering.tiles import TileIdentifier
 from qpane.concurrency import (
     BaseWorker,
     QThreadPoolExecutor,
@@ -34,7 +33,9 @@ from qpane.concurrency import (
 )
 from qpane.masks.autosave import AutosaveManager
 from qpane.rendering import PyramidManager, TileManager
+from qpane.scene.identity import SceneLayerTileKey, default_catalog_asset_key
 from qpane.sam.manager import SamManager
+from tests.helpers.render_plan import make_tile_key
 
 
 def _make_image(size: int = 64) -> QImage:
@@ -70,7 +71,7 @@ def test_concurrency_managers_operate_cleanly(tmp_path, monkeypatch, qapp) -> No
     config.mask_autosave_enabled = True
     pyramid_manager = PyramidManager(config=config, executor=executor)
     tile_manager = TileManager(config=config, executor=executor)
-    tile_events: list[TileIdentifier] = []
+    tile_events: list[SceneLayerTileKey] = []
     tile_manager.tileReady.connect(tile_events.append)
     mask_image = QImage(16, 16, QImage.Format_ARGB32)
     mask_image.fill(QColor("black"))
@@ -101,19 +102,18 @@ def test_concurrency_managers_operate_cleanly(tmp_path, monkeypatch, qapp) -> No
     full_image = _make_image()
     image_id = uuid.uuid4()
     source_path = Path(tmp_path / "sample.png")
-    tile_identifier = TileIdentifier(
-        image_id=image_id,
-        source_path=source_path,
-        pyramid_scale=1.0,
-        row=0,
-        col=0,
-    )
+    tile_identifier = make_tile_key(image_id, source_path, 1.0, 0, 0)
     mask_path = tmp_path / "mask.png"
     predictors: list = []
     sam_manager.predictorReady.connect(
         lambda predictor, predictor_id: predictors.append((predictor, predictor_id))
     )
-    pyramid_manager.generate_pyramid_for_image(image_id, full_image, source_path)
+    asset_key = default_catalog_asset_key(
+        image_id,
+        revision=0,
+        source_path=source_path,
+    )
+    pyramid_manager.generate_pyramid_for_asset(asset_key, full_image)
     tile_manager.get_tile(tile_identifier, full_image)
     autosave_manager.saveMaskToPath("mask-1", str(mask_path))
     sam_manager.requestPredictor(full_image, image_id, source_path=source_path)

@@ -335,7 +335,7 @@ class SamPredictorCacheConsumer:
 
 
 class MaskOverlayCacheConsumer:
-    """Reports mask overlay cache usage through a :class:`MaskController`."""
+    """Reports mask render cache usage through a :class:`MaskController`."""
 
     def __init__(
         self,
@@ -382,7 +382,7 @@ class MaskOverlayCacheConsumer:
         self._notify()
 
     def _get_usage(self) -> int:
-        """Estimate the number of bytes consumed by cached mask overlays."""
+        """Estimate the number of bytes consumed by cached mask renders."""
         usage_attr = getattr(self._controller, "cache_usage_bytes", None)
         if usage_attr is None:
             logger.error(

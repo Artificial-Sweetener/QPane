@@ -26,6 +26,7 @@ from PySide6.QtGui import QImage
 
 from qpane import Config
 from qpane.rendering.pyramid import ImagePyramid, PyramidManager
+from qpane.scene.identity import default_catalog_asset_key
 from tests.helpers.executor_stubs import StubExecutor
 
 
@@ -35,7 +36,7 @@ def test_pyramid_allow_cache_insert_guard(caplog):
     manager = PyramidManager(config=Config(), executor=StubExecutor())
     manager.cache_limit_bytes = 100
     manager.set_admission_guard(lambda _size: False)
-    key = uuid.uuid4()
+    key = default_catalog_asset_key(uuid.uuid4(), revision=0, source_path=None)
     caplog.set_level("WARNING")
     assert manager._allow_cache_insert(50, key) is False
     assert manager._allow_cache_insert(50, key) is False
@@ -53,17 +54,17 @@ def test_pyramid_eviction_batch_drops_entries():
     manager = PyramidManager(config=Config(), executor=StubExecutor())
     manager.cache_limit_bytes = 0
     image_id = uuid.uuid4()
+    key = default_catalog_asset_key(image_id, revision=0, source_path=None)
     pyramid = ImagePyramid(
-        image_id=image_id,
-        source_path=None,
+        asset_key=key,
         full_resolution_image=QImage(4, 4, QImage.Format_ARGB32),
     )
     pyramid.size_bytes = 8
-    manager._cache = OrderedDict({image_id: pyramid})
-    manager._pyramids[image_id] = pyramid
+    manager._cache = OrderedDict({key: pyramid})
+    manager._pyramids[key] = pyramid
     manager._cache_size_bytes = pyramid.size_bytes
     manager._run_eviction_batch()
     assert manager._cache_size_bytes == 0
-    assert image_id not in manager._cache
-    assert image_id not in manager._pyramids
+    assert key not in manager._cache
+    assert key not in manager._pyramids
     assert manager._evictions_total == 1

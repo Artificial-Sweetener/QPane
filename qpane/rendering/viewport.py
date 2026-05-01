@@ -18,8 +18,8 @@
 
 import time
 from dataclasses import dataclass
-from typing import Optional
 from enum import Enum
+from typing import Optional
 
 from PySide6.QtCore import (
     QElapsedTimer,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import QWidget
 
 from ..core import Config
 from .coordinates import CoordinateContext, PanelHitTest
+from ..scene.render_plan import SceneContentSnapshot
 
 
 class ViewportZoomMode(str, Enum):
@@ -64,6 +65,7 @@ class Viewport(QObject):
     _SMOOTH_ZOOM_MIN_DELTA = 1e-4
     _SMOOTH_ZOOM_FAST_THRESHOLD_MS = 40.0
     _SMOOTH_ZOOM_SLOW_THRESHOLD_MS = 160.0
+    _PAN_EPSILON_PX = 1e-6
 
     def __init__(self, qpane: QWidget, config: Config):
         """Initialise viewport state tied to the hosting qpane.
@@ -173,12 +175,12 @@ class Viewport(QObject):
         expansion = self._config.canvas_expansion_factor
         extra_x = (panel_w * (expansion - 1.0)) / 2
         extra_y = (panel_h * (expansion - 1.0)) / 2
-        if img_w <= panel_w:
+        if self._axis_fits(img_w, panel_w):
             x = 0
         else:
             x_max = (img_w - panel_w) / 2 + extra_x
             x = min(max(pan.x(), -x_max), x_max)
-        if img_h <= panel_h:
+        if self._axis_fits(img_h, panel_h):
             y = 0
         else:
             y_max = (img_h - panel_h) / 2 + extra_y
@@ -203,6 +205,8 @@ class Viewport(QObject):
         """Return True when panning could change the viewport based on size and lock state."""
         if self._pan_zoom_locked:
             return False
+        if self.zoom_mode == ViewportZoomMode.FIT:
+            return False
         image_size = self.content_size if image_size is None else image_size
         panel_size = (
             self._physical_viewport_size() if panel_size is None else panel_size
@@ -216,7 +220,11 @@ class Viewport(QObject):
             return False
         img_w = float(image_size.width() * zoom)
         img_h = float(image_size.height() * zoom)
-        return img_w > float(panel_size.width()) or img_h > float(panel_size.height())
+        panel_w = float(panel_size.width())
+        panel_h = float(panel_size.height())
+        return not self._axis_fits(img_w, panel_w) or not self._axis_fits(
+            img_h, panel_h
+        )
 
     def setZoom1To1(self, anchor: QPoint | QPointF | None = None):
         """Snap zoom to native pixel ratio, optionally anchoring to a panel point.
@@ -406,30 +414,38 @@ class Viewport(QObject):
         source_image_size: QSize,
         pyramid_scale: float = 1.0,
         pan_override: QPointF = None,
+        content_snapshot: SceneContentSnapshot | None = None,
     ) -> QTransform:
         """Build the transform mapping source image pixels to logical panel pixels for the current zoom and pan."""
-        context = CoordinateContext(self.qpane, pan_override=pan_override)
+        context = CoordinateContext(
+            self.qpane,
+            pan_override=pan_override,
+            content_snapshot=content_snapshot or self._current_content_snapshot(),
+        )
         return context.get_painter_transform(source_image_size, pyramid_scale)
 
     def panel_to_content_point(self, panel_pos: QPoint) -> QPoint | None:
         """Project a panel coordinate into image space when content is available."""
-        if self.content_size.isNull():
+        content_snapshot = self._current_content_snapshot()
+        if content_snapshot is None:
             return None
-        context = CoordinateContext(self.qpane)
+        context = CoordinateContext(self.qpane, content_snapshot=content_snapshot)
         return context.panel_to_image(QPointF(panel_pos))
 
     def panel_hit_test(self, panel_pos: QPoint) -> PanelHitTest | None:
         """Return content hit-test metadata for a panel coordinate when content is available."""
-        if self.content_size.isNull():
+        content_snapshot = self._current_content_snapshot()
+        if content_snapshot is None:
             return None
-        context = CoordinateContext(self.qpane)
+        context = CoordinateContext(self.qpane, content_snapshot=content_snapshot)
         return context.panel_to_image_hit(QPointF(panel_pos))
 
     def content_to_panel_point(self, content_point: QPoint) -> QPointF | None:
         """Project an image-space coordinate into panel space when content is available."""
-        if self.content_size.isNull():
+        content_snapshot = self._current_content_snapshot()
+        if content_snapshot is None:
             return None
-        context = CoordinateContext(self.qpane)
+        context = CoordinateContext(self.qpane, content_snapshot=content_snapshot)
         return context.image_to_panel(QPointF(content_point))
 
     def smooth_zoom_diagnostics(self) -> SmoothZoomDiagnostics | None:
@@ -471,6 +487,15 @@ class Viewport(QObject):
         if rect is None:
             raise ValueError("QPane.physicalViewportRect must return a QRectF")
         return rect.size()
+
+    def _current_content_snapshot(self) -> SceneContentSnapshot | None:
+        """Return renderable content geometry from the owning view."""
+        view_accessor = getattr(self.qpane, "view", None)
+        view = view_accessor() if callable(view_accessor) else None
+        snapshot_getter = getattr(view, "current_content_snapshot", None)
+        if not callable(snapshot_getter):
+            return None
+        return snapshot_getter()
 
     def _commit_zoom_change(self, zoom: float, pan: QPointF):
         """Clamp pan and zoom, update stored state, and emit viewChanged when values change."""
@@ -560,28 +585,45 @@ class Viewport(QObject):
             t = 1.0
         else:
             t = min(1.0, max(0.0, elapsed_ms / duration))
-        eased = 1.0 - (1.0 - t) * (1.0 - t)
-        zoom = self._zoom_anim_start_zoom + (
-            (self._zoom_anim_target_zoom - self._zoom_anim_start_zoom) * eased
-        )
-        if self._zoom_anim_target_pan is None:
-            pan = self._compute_anchor_pan(
-                self._zoom_anim_start_zoom,
-                self._zoom_anim_start_pan,
-                zoom,
-                None,
-                anchor_physical=self._zoom_anim_anchor_physical,
-                panel_center=self._zoom_anim_panel_center,
-            )
+        if t >= 1.0:
+            zoom = self._zoom_anim_target_zoom
+            pan = self._exact_zoom_animation_target_pan()
         else:
-            pan = self._zoom_anim_start_pan + (
-                (self._zoom_anim_target_pan - self._zoom_anim_start_pan) * eased
+            eased = 1.0 - (1.0 - t) * (1.0 - t)
+            zoom = self._zoom_anim_start_zoom + (
+                (self._zoom_anim_target_zoom - self._zoom_anim_start_zoom) * eased
             )
+            if self._zoom_anim_target_pan is None:
+                pan = self._compute_anchor_pan(
+                    self._zoom_anim_start_zoom,
+                    self._zoom_anim_start_pan,
+                    zoom,
+                    None,
+                    anchor_physical=self._zoom_anim_anchor_physical,
+                    panel_center=self._zoom_anim_panel_center,
+                )
+            else:
+                pan = self._zoom_anim_start_pan + (
+                    (self._zoom_anim_target_pan - self._zoom_anim_start_pan) * eased
+                )
         self._commit_zoom_change(zoom, self._clamp_pan_for_zoom(zoom, pan))
         self._zoom_anim_last_tick_ms = now_ms
         if t >= 1.0:
             self._zoom_anim_pending = False
             self._stop_zoom_animation()
+
+    def _exact_zoom_animation_target_pan(self) -> QPointF:
+        """Return the exact pan target for a completed zoom animation."""
+        if self._zoom_anim_target_pan is not None:
+            return QPointF(self._zoom_anim_target_pan)
+        return self._compute_anchor_pan(
+            self._zoom_anim_start_zoom,
+            self._zoom_anim_start_pan,
+            self._zoom_anim_target_zoom,
+            None,
+            anchor_physical=self._zoom_anim_anchor_physical,
+            panel_center=self._zoom_anim_panel_center,
+        )
 
     def _compute_anchor_pan(
         self,
@@ -615,7 +657,9 @@ class Viewport(QObject):
         panel_size = self._physical_viewport_size()
         img_w = self.content_size.width() * zoom
         img_h = self.content_size.height() * zoom
-        if img_w <= panel_size.width() and img_h <= panel_size.height():
+        if self._axis_fits(img_w, panel_size.width()) and self._axis_fits(
+            img_h, panel_size.height()
+        ):
             return QPointF(0, 0)
         return pan
 
@@ -761,3 +805,8 @@ class Viewport(QObject):
             return
         if manager is not None:
             manager.set_dirty("render")
+
+    @classmethod
+    def _axis_fits(cls, scaled_axis: float, panel_axis: float) -> bool:
+        """Return True when scaled content fits an axis within pan tolerance."""
+        return scaled_axis <= panel_axis + cls._PAN_EPSILON_PX

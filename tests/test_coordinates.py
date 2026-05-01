@@ -23,6 +23,10 @@ from qpane.rendering.coordinates import (
     LogicalPoint,
     PhysicalPoint,
 )
+from qpane.scene.identity import default_catalog_asset_key, default_scene_id
+from qpane.scene.model import LayerPlacement
+from qpane.scene.render_plan import SceneContentSnapshot
+import uuid
 
 
 class _StubViewport:
@@ -64,6 +68,28 @@ class _StubQPane:
     def view(self):
         return self._view
 
+    def content_snapshot(self) -> SceneContentSnapshot:
+        """Return a content snapshot matching the stub image geometry."""
+        image_id = uuid.uuid4()
+        bounds = LayerPlacement(
+            x=0.0,
+            y=0.0,
+            width=float(self.original_image.width()),
+            height=float(self.original_image.height()),
+        )
+        return SceneContentSnapshot(
+            scene_id=default_scene_id(image_id),
+            base_asset_key=default_catalog_asset_key(
+                image_id,
+                revision=0,
+                source_path=None,
+            ),
+            base_image_size=self.original_image.size(),
+            scene_bounds=bounds,
+            active_content_bounds=bounds,
+            current_path=None,
+        )
+
 
 def _make_context(
     *,
@@ -80,7 +106,7 @@ def _make_context(
         zoom=zoom,
         pan=pan,
     )
-    return CoordinateContext(qpane)
+    return CoordinateContext(qpane, content_snapshot=qpane.content_snapshot())
 
 
 def _clamp_int(value: int, minimum: int, maximum: int) -> int:

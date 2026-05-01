@@ -99,7 +99,9 @@ def _cycle(qpane: QPane) -> None:
         }
         and qpane.activeMaskID() is None
     ):
-        mask_id = qpane.createBlankMask(qpane.currentImage.size())
+        image = qpane.currentImage
+        assert image is not None
+        mask_id = qpane.createBlankMask(image.size())
         if mask_id is not None:
             qpane.setActiveMaskID(mask_id)
     qpane.setControlMode(next_mode)

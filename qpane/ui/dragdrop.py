@@ -18,9 +18,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSizeF
+from PySide6.QtCore import QSize, QSizeF
 from PySide6.QtGui import QImage, QMouseEvent
 
 from ..rendering import ViewportZoomMode
@@ -30,40 +31,50 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from ..qpane import QPane
 
 
-def drag_out_image(qpane: "QPane", event: QMouseEvent | None) -> None:
+def drag_out_image(
+    qpane: "QPane",
+    event: QMouseEvent | None,
+    *,
+    image: QImage | None = None,
+    path: Path | None = None,
+) -> None:
     """Forward Qt drag requests to the drag-out helper while preserving the signature.
 
     Args:
         qpane: QPane whose current image should be offered to the OS drag target.
         event: Mouse event forwarded from Qt; accepted only to match the slot signature.
+        image: Optional base image used for the drag preview.
+        path: Optional filesystem path offered to the OS drag target.
     """
     if not getattr(qpane.settings, "drag_out_enabled", True):
         return
-    maybeStartDrag(qpane, event)
+    maybeStartDrag(qpane, event, image=image, path=path)
 
 
 def is_drag_out_allowed(
     *,
-    image: QImage,
+    image_size: QSize | QSizeF,
     zoom: float,
     zoom_mode: ViewportZoomMode,
     viewport_size: QSizeF,
 ) -> bool:
-    """Return True when drag-out gestures keep the image within the current viewport.
+    """Return True when drag-out gestures keep the content within the viewport.
 
     Args:
-        image: Latest rendered image that may be dragged out.
-        zoom: Current zoom factor applied to `image`.
+        image_size: Size of the base image that may be dragged out.
+        zoom: Current zoom factor applied to ``image_size``.
         zoom_mode: Active zoom policy controlling fit vs. manual zoom.
         viewport_size: Visible viewport dimensions expressed in device pixels.
 
     Returns:
         True when the scaled image fits inside the viewport or zoom-fit mode is active.
     """
-    if image.isNull():
+    del zoom_mode
+    if image_size.width() <= 0 or image_size.height() <= 0:
         return False
-    scaled_size = image.size() * zoom
+    scaled_width = image_size.width() * zoom
+    scaled_height = image_size.height() * zoom
     return (
-        scaled_size.width() <= viewport_size.width()
-        and scaled_size.height() <= viewport_size.height()
+        scaled_width <= viewport_size.width()
+        and scaled_height <= viewport_size.height()
     )

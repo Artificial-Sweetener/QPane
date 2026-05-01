@@ -25,7 +25,8 @@ import uuid
 import pytest
 
 from qpane import Config
-from qpane.rendering.tiles import TileIdentifier, TileManager
+from qpane.rendering.tiles import TileManager
+from tests.helpers.render_plan import make_tile_key
 from tests.helpers.executor_stubs import StubExecutor
 
 
@@ -36,7 +37,7 @@ def test_allow_cache_insert_honors_guard(caplog):
     manager.cache_limit_bytes = 100
     manager.set_admission_guard(lambda _size: False)
     image_id = uuid.uuid4()
-    key = TileIdentifier(image_id, Path("a.png"), 1.0, 0, 0)
+    key = make_tile_key(image_id, Path("a.png"), 1.0, 0, 0)
     caplog.set_level("WARNING")
     assert manager._allow_cache_insert(50, key) is False
     assert manager._allow_cache_insert(50, key) is False
@@ -65,7 +66,7 @@ def test_evict_cache_batch_drops_entries():
     """Eviction should remove cached tiles and update bytes."""
     manager = TileManager(config=Config(), executor=StubExecutor())
     image_id = uuid.uuid4()
-    key = TileIdentifier(image_id, Path("a.png"), 1.0, 0, 0)
+    key = make_tile_key(image_id, Path("a.png"), 1.0, 0, 0)
     manager.cache_limit_bytes = 0
     manager._tile_cache = OrderedDict({key: type("Tile", (), {"size_bytes": 5})()})
     manager._cache_size_bytes = 5

@@ -63,14 +63,14 @@ current_id = next(iter(image_map))
 viewer.setImagesByID(image_map, current_id=current_id)
 ```
 
-> **Pro Tip:** `imageMapFromLists` generates stable UUIDs for you if you don't provide them. If you have your own identifiers, pass them as the `ids` argument to keep your domain model in sync.
+> **Pro Tip:** `imageMapFromLists` generates UUIDs for you if you don't provide them. Pass your own persistent UUIDs when your host needs stable identity across catalog rebuilds or app restarts.
 
 ## Inspect State
 Once images are loaded, you can query the viewer for the current state. These properties are read-only; use the catalog methods to make changes.
 
-*   **Check for content:** `QPane.hasImages` returns `True` if the catalog isn't empty.
-*   **Get the active item:** `QPane.currentImageID` gives you the UUID, while `QPane.currentImage` and `QPane.currentImagePath` return the actual data.
-*   **See the full list:** `QPane.imageIDs` returns the ordered list of all loaded image UUIDs.
+* **Check for content:** `QPane.hasImages` returns `True` if the catalog isn't empty.
+* **Get the active item:** `QPane.currentImageID` gives you the UUID, while `QPane.currentImage` returns the `QImage` or `None` and `QPane.currentImagePath` returns the path or `None`.
+* **See the full list:** `QPane.imageIDs` returns the ordered list of all loaded image UUIDs.
 
 ## React to Navigation
 Don't poll the viewer to see what's visible. Instead, connect to `QPane.catalogSelectionChanged`. This signal fires whenever the active image changes—whether the user clicked "Next", pressed a key, or you called `setImagesByID`.
@@ -90,8 +90,8 @@ viewer.catalogSelectionChanged.connect(on_image_changed)
 ## Next Steps
 You have a running viewer. Now you can customize its behavior or add power-user features.
 
-*   **Refine the feel:** [Configuration](configuration.md) covers zoom limits, drag behavior, and defaults.
-*   **Manage the list:** [Catalog and Navigation](catalog-and-navigation.md) explains how to add/remove images and handle large sets.
-*   **Debug your app:** [Diagnostics](diagnostics.md) shows you how to peek at memory usage and tile generation.
+* **Refine the feel:** [Configuration](configuration.md) covers zoom limits, drag behavior, and defaults.
+* **Manage the list:** [Catalog and Navigation](catalog-and-navigation.md) explains how to add/remove images and handle large sets.
+* **Debug your app:** [Diagnostics](diagnostics.md) shows you how to peek at memory usage and tile generation.
 
 **Continue →** [Configuration](configuration.md)

@@ -19,63 +19,28 @@
 import time
 
 from dataclasses import dataclass
-
-from enum import Enum
+from math import isclose
 
 from typing import TYPE_CHECKING
 
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QSizeF, Qt
 
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QRegion, QTransform
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QRegion
 
 
 from .coordinates import CoordinateContext
+from ..scene.render_plan import (
+    MaskLayerRenderItem,
+    RasterLayerRenderItem,
+    RenderStrategy,
+    SceneRenderPlan,
+)
+from ..scene.model import ClipCoordinateSpace
 
 
 if TYPE_CHECKING:
     from ..qpane import QPane
-
-
-@dataclass(frozen=True)
-class TileRenderData:
-    """An immutable container for a single tile to be rendered."""
-
-    image: QImage
-    draw_pos: QPointF
-
-
-class RenderStrategy(str, Enum):
-    """Supported rendering strategies for the base buffer pipeline."""
-
-    DIRECT = "direct"
-    TILE = "tile"
-
-
-@dataclass(frozen=True)
-class RenderState:
-    """An immutable container for all parameters needed for a single render pass."""
-
-    # Image and view properties
-    source_image: QImage
-    pyramid_scale: float
-    transform: QTransform
-    zoom: float
-    strategy: RenderStrategy
-    render_hint_enabled: bool
-    # Overlay/debug data
-    debug_draw_tile_grid: bool
-    # Tiling properties
-    tiles_to_draw: list[TileRenderData]
-    tile_size: int
-    tile_overlap: int
-    max_tile_cols: int
-    max_tile_rows: int
-    # Context from the QPane
-    qpane_rect: QRect
-    current_pan: QPointF
-    physical_viewport_rect: QRectF
-    visible_tile_range: tuple[int, int, int, int] | None
 
 
 @dataclass(frozen=True)
@@ -97,7 +62,7 @@ class Renderer:
     def __init__(self, qpane: "QPane"):
         """Bind rendering to `qpane` while tracking buffer reuse health."""
         self._qpane = qpane
-        self._current_render_state: RenderState | None = None
+        self._current_render_plan: SceneRenderPlan | None = None
         self._base_image_buffer = None
         self._dirty_region = QRegion()
         self._buffer_pan = QPointF(0, 0)
@@ -119,17 +84,17 @@ class Renderer:
         """Return the QPane associated with this renderer."""
         return self._qpane
 
-    def paint(self, state: RenderState):
-        """Prepare offscreen buffers for the requested state without drawing to the widget."""
+    def paint(self, plan: SceneRenderPlan):
+        """Prepare offscreen buffers for the requested scene without drawing to the widget."""
         start_time = time.perf_counter()
         # Ensure buffers are allocated. The QPane is responsible for calling
         # _allocate_buffers on resize, but we need to handle the initial case.
         if self._base_image_buffer is None:
-            self.markDirty(state.qpane_rect)  # Mark entire view dirty for first paint
+            self.markDirty(plan.qpane_rect)  # Mark entire view dirty for first paint
         # Redraw dirty buffers if any region has been marked as dirty.
         if not self._dirty_region.isEmpty():
-            # Pass the entire region object and state to the redraw methods.
-            self._redraw_base_image_buffer(self._dirty_region, state)
+            # Pass the entire region object and plan to the redraw methods.
+            self._redraw_base_image_buffer(self._dirty_region, plan)
         # Clear the dirty region now that buffer painting is complete for this frame.
         self._dirty_region = QRegion()
         end_time = time.perf_counter()
@@ -219,14 +184,16 @@ class Renderer:
         if dx < 0:
             repair_rects.append(QRect(w + dx, 0, -dx, h))
         if repair_rects:
-            qpane_calculate = getattr(self.qpane, "calculateRenderState", None)
-            if not callable(qpane_calculate):
+            qpane_view = getattr(self.qpane, "view", None)
+            view = qpane_view() if callable(qpane_view) else None
+            plan_calculate = getattr(view, "calculateRenderPlan", None)
+            if not callable(plan_calculate):
                 raise AttributeError(
-                    "QPane must provide calculateRenderState for buffer repair"
+                    "QPane view must provide calculateRenderPlan for buffer repair"
                 )
-            state = qpane_calculate(use_pan=self._buffer_pan)
-            if state:
-                self._repair_base_buffer_strips(repair_rects, state)
+            plan = plan_calculate(use_pan=self._buffer_pan)
+            if plan:
+                self._repair_base_buffer_strips(repair_rects, plan)
         self._scroll_hits += 1
         viewport = self.qpane.view().viewport
         self._subpixel_pan_offset = viewport.pan - self._buffer_pan
@@ -238,9 +205,9 @@ class Renderer:
         """Return the duration of the last paint call in milliseconds."""
         return self._last_paint_duration_ms
 
-    def get_current_render_state(self) -> RenderState | None:
-        """Return the most recent render state captured during painting."""
-        return self._current_render_state
+    def get_current_render_plan(self) -> SceneRenderPlan | None:
+        """Return the most recent scene render plan captured during painting."""
+        return self._current_render_plan
 
     def get_base_buffer(self) -> QImage | None:
         """Return the current base image buffer used for painting."""
@@ -276,12 +243,12 @@ class Renderer:
         )
 
     def _buffer_rect_to_image_rect(
-        self, buffer_rect_phys: QRectF, render_state: "RenderState"
+        self, buffer_rect_phys: QRectF, item: RasterLayerRenderItem
     ) -> QRectF:
         """Map a physical buffer rectangle back into source-image coordinates using the inverse transform."""
-        # The transform in the render state maps: Source Image -> Logical Buffer Coords.
+        # The item transform maps source image coordinates to logical buffer coordinates.
         # We need the inverse to map from the buffer back to the source image.
-        fwd_transform = render_state.transform
+        fwd_transform = item.transform
         inv_transform, is_invertible = fwd_transform.inverted()
         if not is_invertible:
             return QRectF()
@@ -293,32 +260,248 @@ class Renderer:
         # This is more numerically stable than mapping individual points.
         return inv_transform.mapRect(buffer_rect_log)
 
-    def _repair_base_buffer_strips(self, repair_rects: list[QRect], state: RenderState):
-        """Repairs the base image and any overlays in the given rectangular strips."""
-        source_image_for_repair = state.source_image
+    def _repair_base_buffer_strips(
+        self, repair_rects: list[QRect], plan: SceneRenderPlan
+    ):
+        """Repair scene strips after buffer scrolling."""
+        if not plan.render_items:
+            return
+        if self._can_repair_base_strips_directly(plan):
+            self._repair_base_raster_strips_directly(repair_rects, plan)
+            return
+        if self._repair_layered_strips(repair_rects, plan):
+            return
         painter = QPainter(self._base_image_buffer)
         context = CoordinateContext(self.qpane)
         try:
-            if state.render_hint_enabled:
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            clip_region = QRegion()
             for rect in repair_rects:
-                dest_rect_phys = QRectF(rect)
-                dest_rect_log = context.physical_to_logical(dest_rect_phys)
-                source_rect = self._buffer_rect_to_image_rect(dest_rect_phys, state)
-                if source_rect.isValid():
-                    painter.drawImage(
-                        dest_rect_log, source_image_for_repair, source_rect
-                    )
-            if state.strategy == RenderStrategy.TILE:
-                base_clip_region_log = QRegion()
-                for rect in repair_rects:
-                    logical_rect = context.physical_to_logical(QRectF(rect)).toRect()
-                    base_clip_region_log = base_clip_region_log.united(logical_rect)
-                painter.setClipRegion(base_clip_region_log)
-                painter.setTransform(state.transform)
-                self._draw_tile_debug_overlay(painter, state)
+                logical_rect = context.physical_to_logical(QRectF(rect)).toRect()
+                clip_region = clip_region.united(QRegion(logical_rect))
+            painter.setClipRegion(clip_region)
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            for rect in repair_rects:
+                painter.fillRect(
+                    context.physical_to_logical(QRectF(rect)), Qt.transparent
+                )
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            self._draw_visible_scene_items(painter, plan)
         finally:
             painter.end()
+
+    def _can_repair_base_strips_directly(self, plan: SceneRenderPlan) -> bool:
+        """Return True when scroll repair can use the base-image fast path."""
+        return self._base_only_raster_item(plan) is not None
+
+    def _repair_base_raster_strips_directly(
+        self, repair_rects: list[QRect], plan: SceneRenderPlan
+    ) -> None:
+        """Repair base-only scroll strips by drawing mapped source rectangles."""
+        base_item = plan.base_raster_item
+        if base_item is None:
+            return
+        painter = QPainter(self._base_image_buffer)
+        context = CoordinateContext(self.qpane)
+        try:
+            clip_region = self._logical_region_for_physical_rects(
+                repair_rects,
+                context,
+            )
+            painter.setClipRegion(clip_region)
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            for rect in repair_rects:
+                painter.fillRect(
+                    context.physical_to_logical(QRectF(rect)),
+                    Qt.transparent,
+                )
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            painter.save()
+            try:
+                if base_item.render_hint_enabled:
+                    painter.setRenderHint(
+                        QPainter.RenderHint.SmoothPixmapTransform,
+                        True,
+                    )
+                painter.setTransform(base_item.transform)
+                self._draw_raster_source_strips(
+                    painter,
+                    base_item,
+                    repair_rects,
+                    context,
+                    draw_source_for_tiled=True,
+                )
+                if base_item.debug_draw_tile_grid:
+                    self._draw_tile_debug_overlay(painter, plan, base_item)
+            finally:
+                painter.restore()
+        finally:
+            painter.end()
+
+    def _repair_layered_strips(
+        self,
+        repair_rects: list[QRect],
+        plan: SceneRenderPlan,
+    ) -> bool:
+        """Repair layered scroll strips while culling items outside the strip."""
+        context = CoordinateContext(self.qpane)
+        repair_region = self._logical_region_for_physical_rects(repair_rects, context)
+        if repair_region.isEmpty():
+            return True
+        painter = QPainter(self._base_image_buffer)
+        try:
+            painter.setClipRegion(repair_region)
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            for rect in repair_rects:
+                painter.fillRect(
+                    context.physical_to_logical(QRectF(rect)),
+                    Qt.transparent,
+                )
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            for item in plan.render_items:
+                if not item.descriptor.visible:
+                    continue
+                item_bounds = self._item_panel_bounds(item)
+                if item_bounds.isEmpty():
+                    return False
+                if repair_region.intersected(QRegion(item_bounds)).isEmpty():
+                    continue
+                painter.save()
+                try:
+                    painter.setTransform(item.transform)
+                    self._apply_layer_clip(painter, plan, item)
+                    if isinstance(item, RasterLayerRenderItem):
+                        if not self._draw_raster_source_strips(
+                            painter,
+                            item,
+                            repair_rects,
+                            context,
+                        ):
+                            return False
+                    elif isinstance(item, MaskLayerRenderItem):
+                        painter.setOpacity(item.descriptor.opacity)
+                        if not self._draw_pixmap_source_strips(
+                            painter,
+                            item,
+                            repair_rects,
+                            context,
+                        ):
+                            painter.drawPixmap(0, 0, item.pixmap)
+                finally:
+                    painter.restore()
+            return True
+        finally:
+            painter.end()
+
+    @staticmethod
+    def _logical_region_for_physical_rects(
+        repair_rects: list[QRect],
+        context: CoordinateContext,
+    ) -> QRegion:
+        """Return a logical clip region for physical buffer repair rectangles."""
+        clip_region = QRegion()
+        for rect in repair_rects:
+            logical_rect = context.physical_to_logical(QRectF(rect)).toRect()
+            clip_region = clip_region.united(QRegion(logical_rect))
+        return clip_region
+
+    @staticmethod
+    def _item_panel_bounds(
+        item: RasterLayerRenderItem | MaskLayerRenderItem,
+    ) -> QRect:
+        """Return the approximate panel bounds for a render item."""
+        source_width, source_height = Renderer._item_source_size(item)
+        if source_width <= 0 or source_height <= 0:
+            return QRect()
+        source_rect = QRectF(0.0, 0.0, float(source_width), float(source_height))
+        return (
+            item.transform.mapRect(source_rect)
+            .toAlignedRect()
+            .adjusted(
+                -1,
+                -1,
+                1,
+                1,
+            )
+        )
+
+    def _draw_raster_source_strips(
+        self,
+        painter: QPainter,
+        item: RasterLayerRenderItem,
+        repair_rects: list[QRect],
+        context: CoordinateContext,
+        *,
+        draw_source_for_tiled: bool = False,
+    ) -> bool:
+        """Draw only source pixels that map into the repaired strip rectangles."""
+        inverse, invertible = item.transform.inverted()
+        if not invertible:
+            return False
+        source_bounds = QRectF(
+            0.0,
+            0.0,
+            float(item.source_image.width()),
+            float(item.source_image.height()),
+        )
+        for rect in repair_rects:
+            source_rect = inverse.mapRect(
+                context.physical_to_logical(QRectF(rect))
+            ).intersected(source_bounds)
+            if source_rect.isEmpty():
+                continue
+            if item.strategy == RenderStrategy.TILE and not draw_source_for_tiled:
+                self._draw_intersecting_tile_strips(painter, item, source_rect)
+            else:
+                painter.drawImage(source_rect, item.source_image, source_rect)
+        return True
+
+    def _draw_pixmap_source_strips(
+        self,
+        painter: QPainter,
+        item: MaskLayerRenderItem,
+        repair_rects: list[QRect],
+        context: CoordinateContext,
+    ) -> bool:
+        """Draw only pixmap source pixels that map into repaired strips."""
+        inverse, invertible = item.transform.inverted()
+        if not invertible:
+            return False
+        source_bounds = QRectF(
+            0.0,
+            0.0,
+            float(item.pixmap.width()),
+            float(item.pixmap.height()),
+        )
+        for rect in repair_rects:
+            source_rect = inverse.mapRect(
+                context.physical_to_logical(QRectF(rect))
+            ).intersected(source_bounds)
+            if source_rect.isEmpty():
+                continue
+            painter.drawPixmap(source_rect, item.pixmap, source_rect)
+        return True
+
+    @staticmethod
+    def _draw_intersecting_tile_strips(
+        painter: QPainter,
+        item: RasterLayerRenderItem,
+        repair_source_rect: QRectF,
+    ) -> None:
+        """Draw only tile payloads whose source rect intersects a repaired strip."""
+        tile_size = item.tile_size
+        if tile_size <= 0:
+            return
+        for tile_data in item.tiles_to_draw:
+            tile_rect = QRectF(
+                tile_data.draw_pos,
+                QSizeF(tile_data.image.width(), tile_data.image.height()),
+            )
+            intersected = tile_rect.intersected(repair_source_rect)
+            if intersected.isEmpty():
+                continue
+            source_offset = intersected.topLeft() - tile_data.draw_pos
+            tile_source_rect = QRectF(source_offset, intersected.size())
+            painter.drawImage(intersected, tile_data.image, tile_source_rect)
 
     def _allocate_dpi_buffer(self, physical_size: QSize, dpr: float) -> QImage:
         """Create an ARGB buffer tagged with the given DPR for the physical viewport size."""
@@ -326,24 +509,50 @@ class Renderer:
         buffer.setDevicePixelRatio(dpr)
         return buffer
 
-    def _redraw_base_image_buffer(self, dirty_region: QRegion, state: RenderState):
+    def _redraw_base_image_buffer(self, dirty_region: QRegion, plan: SceneRenderPlan):
         """Repaint the base buffer for the dirty region, clearing outside-image areas before drawing."""
         if self._base_image_buffer is None:
             return
-        qpane_rect = state.qpane_rect
+        qpane_rect = plan.qpane_rect
         qpane_region = QRegion(qpane_rect)
         if dirty_region.intersected(qpane_region) == qpane_region:
             self._full_redraws += 1
         else:
             self._partial_redraws += 1
-        self._current_render_state = state
+        self._current_render_plan = plan
         buffer_painter = QPainter(self._base_image_buffer)
         try:
+            base_only_item = self._base_only_raster_item(plan)
+            if base_only_item is not None:
+                self._redraw_base_only_dirty_region(
+                    buffer_painter,
+                    dirty_region,
+                    plan,
+                    base_only_item,
+                )
+                return
+            base_item = plan.base_raster_item
+            if base_item is None:
+                buffer_painter.setClipRegion(dirty_region)
+                buffer_painter.setCompositionMode(QPainter.CompositionMode_Source)
+                for rect in dirty_region:
+                    buffer_painter.fillRect(rect, Qt.transparent)
+                buffer_painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                self._draw_visible_scene_items(buffer_painter, plan)
+                return
+            if plan.scene_bounds != base_item.placement:
+                buffer_painter.setClipRegion(dirty_region)
+                buffer_painter.setCompositionMode(QPainter.CompositionMode_Source)
+                for rect in dirty_region:
+                    buffer_painter.fillRect(rect, Qt.transparent)
+                buffer_painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                self._draw_visible_scene_items(buffer_painter, plan)
+                return
             # Image bounds in buffer coords (no double-transform).
             img_src = QRectF(
-                0, 0, state.source_image.width(), state.source_image.height()
+                0, 0, base_item.source_image.width(), base_item.source_image.height()
             )
-            img_log = state.transform.mapRect(img_src)
+            img_log = base_item.transform.mapRect(img_src)
             # Use aligned bounds with a small expansion to avoid rounding gaps.
             img_region = QRegion(img_log.toAlignedRect().adjusted(-1, -1, 1, 1))
             # Split the incoming dirty region into outside/inside parts.
@@ -363,37 +572,237 @@ class Renderer:
                 for rect in inside_region:
                     buffer_painter.fillRect(rect, Qt.transparent)
                 buffer_painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-                if state.render_hint_enabled:
-                    buffer_painter.setRenderHint(
-                        QPainter.RenderHint.SmoothPixmapTransform, True
-                    )
-                buffer_painter.setTransform(state.transform)
-                if state.strategy == RenderStrategy.DIRECT:
-                    self._draw_direct_view(buffer_painter, state)
-                elif state.strategy == RenderStrategy.TILE:
-                    self._draw_tiled_view(buffer_painter, state)
+                self._draw_visible_scene_items(buffer_painter, plan)
         finally:
             buffer_painter.end()
-            if state.qpane_rect in dirty_region:
-                self._buffer_pan = QPointF(state.current_pan)
+            if plan.qpane_rect in dirty_region:
+                self._buffer_pan = QPointF(plan.current_pan)
                 self._subpixel_pan_offset = QPointF(0, 0)
 
-    def _draw_tile_debug_overlay(self, painter: QPainter, state: RenderState):
-        """Draw a debug grid over the visible tiles using the current transform."""
-        if not state.debug_draw_tile_grid:
+    @staticmethod
+    def _base_only_raster_item(plan: SceneRenderPlan) -> RasterLayerRenderItem | None:
+        """Return the sole base raster item when a plan matches old-QPane shape."""
+        if len(plan.render_items) != 1:
+            return None
+        item = plan.render_items[0]
+        if not isinstance(item, RasterLayerRenderItem):
+            return None
+        if item is not plan.base_raster_item:
+            return None
+        if not item.descriptor.visible:
+            return None
+        if not isclose(item.descriptor.opacity, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            return None
+        if item.clip is not None:
+            return None
+        if item.placement != plan.scene_bounds:
+            return None
+        if item.source_image.isNull():
+            return None
+        return item
+
+    def _redraw_base_only_dirty_region(
+        self,
+        painter: QPainter,
+        dirty_region: QRegion,
+        plan: SceneRenderPlan,
+        item: RasterLayerRenderItem,
+    ) -> None:
+        """Redraw a dirty region for a single full-scene base raster item."""
+        image_rect = QRectF(0, 0, item.source_image.width(), item.source_image.height())
+        image_region = QRegion(
+            item.transform.mapRect(image_rect).toAlignedRect().adjusted(-1, -1, 1, 1)
+        )
+        outside_region = dirty_region.subtracted(image_region)
+        inside_region = dirty_region.intersected(image_region)
+        self._clear_dirty_region(painter, outside_region)
+        if inside_region.isEmpty():
             return
-        max_cols, max_rows = state.max_tile_cols, state.max_tile_rows
+        self._clear_dirty_region(painter, inside_region)
+        painter.setClipRegion(inside_region)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.save()
+        try:
+            if item.render_hint_enabled:
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.setTransform(item.transform)
+            if item.strategy == RenderStrategy.DIRECT:
+                self._draw_direct_view(painter, item)
+            elif item.strategy == RenderStrategy.TILE:
+                self._draw_tiled_view(painter, plan, item)
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _clear_dirty_region(painter: QPainter, dirty_region: QRegion) -> None:
+        """Clear a non-empty dirty region with source composition."""
+        if dirty_region.isEmpty():
+            return
+        painter.setClipRegion(dirty_region)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        for rect in dirty_region:
+            painter.fillRect(rect, Qt.transparent)
+
+    def _draw_visible_scene_items(
+        self, painter: QPainter, plan: SceneRenderPlan
+    ) -> None:
+        """Draw visible scene raster items in bottom-to-top order."""
+        for item in plan.render_items:
+            if not item.descriptor.visible:
+                continue
+            painter.save()
+            try:
+                if isinstance(item, RasterLayerRenderItem):
+                    self._draw_raster_item(painter, plan, item)
+                elif isinstance(item, MaskLayerRenderItem):
+                    self._draw_mask_item(painter, plan, item)
+            finally:
+                painter.restore()
+
+    def _draw_raster_item(
+        self,
+        painter: QPainter,
+        plan: SceneRenderPlan,
+        item: RasterLayerRenderItem,
+    ) -> None:
+        """Draw one raster image item."""
+        if item.render_hint_enabled:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(item.transform)
+        self._apply_layer_clip(painter, plan, item)
+        if item.strategy == RenderStrategy.DIRECT:
+            self._draw_direct_view(painter, item)
+        elif item.strategy == RenderStrategy.TILE:
+            self._draw_tiled_view(painter, plan, item)
+
+    def _draw_mask_item(
+        self,
+        painter: QPainter,
+        plan: SceneRenderPlan,
+        item: MaskLayerRenderItem,
+    ) -> None:
+        """Draw one colorized mask item."""
+        if item.render_hint_enabled:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(item.transform)
+        self._apply_layer_clip(painter, plan, item)
+        painter.setOpacity(item.descriptor.opacity)
+        painter.drawPixmap(0, 0, item.pixmap)
+
+    def _apply_layer_clip(
+        self,
+        painter: QPainter,
+        plan: SceneRenderPlan,
+        item: RasterLayerRenderItem | MaskLayerRenderItem,
+    ) -> None:
+        """Apply a layer clip in its declared coordinate space."""
+        clip = item.clip
+        if clip is None:
+            return
+        source_width, source_height = self._item_source_size(item)
+        if clip.coordinate_space == ClipCoordinateSpace.NORMALIZED_SCENE:
+            scene_clip = QRectF(
+                plan.scene_bounds.x + clip.x * plan.scene_bounds.width,
+                plan.scene_bounds.y + clip.y * plan.scene_bounds.height,
+                clip.width * plan.scene_bounds.width,
+                clip.height * plan.scene_bounds.height,
+            )
+        elif clip.coordinate_space == ClipCoordinateSpace.SCENE:
+            scene_clip = QRectF(clip.x, clip.y, clip.width, clip.height)
+        elif clip.coordinate_space == ClipCoordinateSpace.NORMALIZED_VIEWPORT:
+            viewport_clip = QRectF(
+                plan.qpane_rect.x() + clip.x * plan.qpane_rect.width(),
+                plan.qpane_rect.y() + clip.y * plan.qpane_rect.height(),
+                clip.width * plan.qpane_rect.width(),
+                clip.height * plan.qpane_rect.height(),
+            )
+            rect = self._viewport_clip_to_source(item, viewport_clip)
+            self._set_source_clip_rect(painter, rect)
+            return
+        elif clip.coordinate_space == ClipCoordinateSpace.VIEWPORT:
+            rect = self._viewport_clip_to_source(
+                item, QRectF(clip.x, clip.y, clip.width, clip.height)
+            )
+            self._set_source_clip_rect(painter, rect)
+            return
+        else:
+            return
+        rect = self._scene_clip_to_source(
+            item,
+            scene_clip,
+            source_width=source_width,
+            source_height=source_height,
+        )
+        self._set_source_clip_rect(painter, rect)
+
+    @staticmethod
+    def _item_source_size(
+        item: RasterLayerRenderItem | MaskLayerRenderItem,
+    ) -> tuple[int, int]:
+        """Return source dimensions for the render item."""
+        if isinstance(item, RasterLayerRenderItem):
+            return item.source_image.width(), item.source_image.height()
+        return item.pixmap.width(), item.pixmap.height()
+
+    @staticmethod
+    def _scene_clip_to_source(
+        item: RasterLayerRenderItem | MaskLayerRenderItem,
+        scene_clip: QRectF,
+        *,
+        source_width: int,
+        source_height: int,
+    ) -> QRectF:
+        """Convert a scene-space clip into item source coordinates."""
+        placement = item.placement
+        if placement.width <= 0.0 or placement.height <= 0.0:
+            return QRectF()
+        return QRectF(
+            (scene_clip.x() - placement.x) * source_width / placement.width,
+            (scene_clip.y() - placement.y) * source_height / placement.height,
+            scene_clip.width() * source_width / placement.width,
+            scene_clip.height() * source_height / placement.height,
+        )
+
+    @staticmethod
+    def _viewport_clip_to_source(
+        item: RasterLayerRenderItem | MaskLayerRenderItem,
+        viewport_clip: QRectF,
+    ) -> QRectF:
+        """Convert a viewport-space clip into item source coordinates."""
+        inverse, invertible = item.transform.inverted()
+        if not invertible:
+            return QRectF()
+        return inverse.mapRect(viewport_clip)
+
+    @staticmethod
+    def _set_source_clip_rect(painter: QPainter, rect: QRectF) -> None:
+        """Set the painter clip in item source coordinates."""
+        if rect.isEmpty():
+            painter.setClipRect(QRectF())
+            return
+        painter.setClipRect(rect)
+
+    def _draw_tile_debug_overlay(
+        self,
+        painter: QPainter,
+        plan: SceneRenderPlan,
+        item: RasterLayerRenderItem,
+    ):
+        """Draw a debug grid over the visible tiles using the current transform."""
+        if not item.debug_draw_tile_grid:
+            return
+        max_cols, max_rows = item.max_tile_cols, item.max_tile_rows
         if max_cols <= 0 or max_rows <= 0:
             return
-        tile_size = state.tile_size
-        stride = max(1, tile_size - state.tile_overlap)
-        visible_range = state.visible_tile_range
+        tile_size = item.tile_size
+        stride = max(1, tile_size - item.tile_overlap)
+        visible_range = item.visible_tile_range
         if visible_range is None:
             return
         start_row, end_row, start_col, end_col = visible_range
         if start_row > end_row or start_col > end_col:
             return
-        effective_zoom = state.zoom / state.pyramid_scale
+        effective_zoom = plan.zoom / item.pyramid_scale
         pen = QPen(QColor(255, 0, 0, 100))
         pen.setWidthF(2.0 / effective_zoom)
         painter.setPen(pen)
@@ -404,24 +813,32 @@ class Renderer:
                 debug_rect = QRectF(draw_pos, QSizeF(tile_size, tile_size))
                 painter.drawRect(debug_rect)
 
-    def _draw_tiled_view(self, painter: QPainter, state: RenderState):
-        """Draw the tiled view clipped to the image bounds using the render state's transform."""
+    def _draw_tiled_view(
+        self,
+        painter: QPainter,
+        plan: SceneRenderPlan,
+        item: RasterLayerRenderItem,
+    ):
+        """Draw the tiled view clipped to the image bounds using the item transform."""
         img_rect_src = QRectF(
-            0, 0, state.source_image.width(), state.source_image.height()
+            0, 0, item.source_image.width(), item.source_image.height()
         )
         painter.save()
         # Slight padding guards against subpixel rounding at the edges.
-        painter.setClipRect(img_rect_src.adjusted(-0.5, -0.5, 0.5, 0.5))
-        painter.drawImage(0, 0, state.source_image)
-        for tile_data in state.tiles_to_draw:
+        painter.setClipRect(
+            img_rect_src.adjusted(-0.5, -0.5, 0.5, 0.5),
+            Qt.ClipOperation.IntersectClip,
+        )
+        painter.drawImage(0, 0, item.source_image)
+        for tile_data in item.tiles_to_draw:
             painter.drawImage(tile_data.draw_pos, tile_data.image)
-        if state.debug_draw_tile_grid:
-            self._draw_tile_debug_overlay(painter, state)
+        if item.debug_draw_tile_grid:
+            self._draw_tile_debug_overlay(painter, plan, item)
         painter.restore()
 
-    def _draw_direct_view(self, painter: QPainter, state: RenderState):
+    def _draw_direct_view(self, painter: QPainter, item: RasterLayerRenderItem):
         """Draw the source image directly with no tiling helpers."""
-        painter.drawImage(0, 0, state.source_image)
+        painter.drawImage(0, 0, item.source_image)
 
     def _mark_diagnostics_dirty(self) -> None:
         """Mark render diagnostics dirty on the QPane if available."""

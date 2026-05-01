@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import Qt
@@ -32,7 +34,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication
 
 from .. import ui
-from ..core import CursorProvider, OverlayDrawFn
+from ..core import CursorProvider, OverlayDrawFn, SceneOverlayDrawFn
 from ..ui import (
     apply_widget_defaults,
 )
@@ -61,6 +63,7 @@ class ToolInteractionDelegate:
         self._alt_key_held = False
         self._shift_key_held = False
         self._content_overlays: dict[str, OverlayDrawFn] = {}
+        self._scene_overlays: dict[str, SceneOverlayDrawFn] = {}
         self._cursor_providers: dict[str, CursorProvider] = {}
         self._overlays_suspended = False
         self._overlays_resume_pending = False
@@ -75,6 +78,11 @@ class ToolInteractionDelegate:
     def content_overlays(self) -> dict[str, OverlayDrawFn]:
         """Return overlay draw callbacks keyed by overlay name."""
         return self._content_overlays
+
+    @property
+    def scene_overlays(self) -> dict[str, SceneOverlayDrawFn]:
+        """Return scene overlay callbacks keyed by overlay name."""
+        return self._scene_overlays
 
     @property
     def custom_cursor(self):
@@ -172,6 +180,24 @@ class ToolInteractionDelegate:
         """Remove a previously registered overlay if it exists."""
         self._content_overlays.pop(name, None)
 
+    def content_overlays_snapshot(self) -> Mapping[str, OverlayDrawFn]:
+        """Return a read-only snapshot of registered content overlays."""
+        return MappingProxyType(dict(self._content_overlays))
+
+    def registerSceneOverlay(self, name: str, draw_fn: SceneOverlayDrawFn) -> None:
+        """Register a scene overlay draw hook under the provided identifier."""
+        if name in self._scene_overlays:
+            raise ValueError(f"Scene overlay '{name}' already registered")
+        self._scene_overlays[name] = draw_fn
+
+    def unregisterSceneOverlay(self, name: str) -> None:
+        """Remove a previously registered scene overlay if it exists."""
+        self._scene_overlays.pop(name, None)
+
+    def scene_overlays_snapshot(self) -> Mapping[str, SceneOverlayDrawFn]:
+        """Return a read-only snapshot of registered scene overlays."""
+        return MappingProxyType(dict(self._scene_overlays))
+
     def registerCursorProvider(self, mode: str, provider: CursorProvider) -> None:
         """Attach a cursor provider for the given mode and apply it immediately when active."""
         self._cursor_providers[mode] = provider
@@ -267,20 +293,20 @@ class ToolInteractionDelegate:
                 "panel_to_content_point": viewport.panel_to_content_point,
                 "image_to_panel_point": viewport.content_to_panel_point,
                 "is_pan_zoom_locked": viewport.is_locked,
-                "is_image_null": lambda: qpane.original_image.isNull(),
+                "is_image_null": lambda: not qpane.view().has_renderable_content(),
                 "is_drag_out_allowed": qpane.isDragOutAllowed,
                 "is_point_in_widget": lambda point: qpane.rect().contains(point),
-                "get_image_rect": lambda: qpane.original_image.rect(),
+                "get_image_rect": qpane.view().content_rect,
                 "get_pan": lambda: viewport.pan,
                 "get_zoom": lambda: viewport.zoom,
                 "get_native_zoom": viewport.nativeZoom,
                 "get_fit_zoom": viewport.computeFitZoom,
                 "can_pan": lambda: (
                     False
-                    if qpane.original_image.isNull()
+                    if not qpane.view().has_renderable_content()
                     else viewport.can_pan(
                         zoom=viewport.zoom,
-                        image_size=qpane.original_image.size(),
+                        image_size=qpane.view().content_rect().size(),
                         panel_size=qpane.physicalViewportRect().size(),
                     )
                 ),
@@ -320,6 +346,13 @@ class ToolInteractionDelegate:
         qpane = self._qpane
         if qpane._is_blank:
             qpane.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            return
+        try:
+            divider_cursor = qpane.comparisonDividerInteraction().cursor()
+        except AttributeError:
+            divider_cursor = None
+        if divider_cursor is not None:
+            qpane.setCursor(divider_cursor)
             return
         tools = qpane._tools_manager
         active_tool = tools.get_active_tool()
@@ -394,7 +427,7 @@ class ToolInteractionDelegate:
         qpane = self._qpane
         if guard_blank and qpane._is_blank:
             return
-        if guard_image and qpane.original_image.isNull():
+        if guard_image and not qpane.view().has_renderable_content():
             return
         handler(event)
 
@@ -406,15 +439,23 @@ class ToolInteractionDelegate:
 
     def handle_mouse_press(self, event: QMouseEvent) -> None:
         """Forward mouse press events to the active tool."""
+        if self._qpane.comparisonDividerInteraction().handle_mouse_press(event):
+            return
         self._forward_tool_event(self._qpane._tools_manager.mousePressEvent, event)
 
     def handle_mouse_move(self, event: QMouseEvent) -> None:
         """Forward mouse move events to the active tool."""
+        if self._qpane.comparisonDividerInteraction().handle_mouse_move(event):
+            self.update_cursor()
+            return
         self.update_cursor()
         self._forward_tool_event(self._qpane._tools_manager.mouseMoveEvent, event)
 
     def handle_mouse_release(self, event: QMouseEvent) -> None:
         """Forward mouse release events to the active tool."""
+        if self._qpane.comparisonDividerInteraction().handle_mouse_release(event):
+            self.update_cursor()
+            return
         self._forward_tool_event(self._qpane._tools_manager.mouseReleaseEvent, event)
 
     def handle_mouse_double_click(self, event: QMouseEvent) -> None:
@@ -432,6 +473,8 @@ class ToolInteractionDelegate:
 
     def handle_leave_event(self, event) -> None:
         """Notify the active tool that the cursor left the widget."""
+        self._qpane.comparisonDividerInteraction().cancel_drag()
+        self._qpane.update()
         self._forward_tool_event(
             self._qpane._tools_manager.leaveEvent, event, guard_blank=False
         )

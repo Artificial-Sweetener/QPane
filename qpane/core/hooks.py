@@ -38,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from ..tools.base import ExtensionTool
     from ..autosave import AutosaveManager
     from ..qpane import QPane
-    from ..types import OverlayState
+    from ..types import OverlayState, QPaneSceneOverlayState
     from .diagnostics import DiagnosticsProvider
 
 
@@ -59,10 +59,18 @@ class ToolSignalBinder(Protocol):
 
 
 class OverlayDrawFn(Protocol):
-    """Callable that draws additional content overlays after the base image."""
+    """Callable that draws public overlays after rendered scene content."""
 
     def __call__(self, painter: QPainter, state: "OverlayState") -> None:
-        """Render overlay content after the base image is painted."""
+        """Render overlay content after the scene content is painted."""
+        ...
+
+
+class SceneOverlayDrawFn(Protocol):
+    """Callable that draws host chrome relative to layered scene composition layers."""
+
+    def __call__(self, painter: QPainter, state: "QPaneSceneOverlayState") -> None:
+        """Render scene overlay content after composed scene pixels are painted."""
         ...
 
 
@@ -109,11 +117,11 @@ class QPaneHooks:
         self.qpane._tools_manager.unregisterTool(mode)
 
     def registerOverlay(self, name: str, draw_fn: OverlayDrawFn) -> None:
-        """Register a named overlay that renders after the base image.
+        """Register a named overlay that renders after scene content.
 
         Args:
             name: Identifier used to manage the overlay lifecycle.
-            draw_fn: Callable invoked after the base image finishes rendering.
+            draw_fn: Callable invoked after scene content finishes rendering.
 
         Raises:
             ValueError: If `name` is already registered.
@@ -126,6 +134,22 @@ class QPaneHooks:
         Missing entries are ignored so callers can always unregister during teardown.
         """
         self.qpane.interaction.unregisterOverlay(name)
+
+    def registerSceneOverlay(self, name: str, draw_fn: SceneOverlayDrawFn) -> None:
+        """Register a named overlay that renders against layered scene composition layers.
+
+        Args:
+            name: Identifier used to manage the overlay lifecycle.
+            draw_fn: Callable invoked after layered scene composition content renders.
+
+        Raises:
+            ValueError: If `name` is already registered.
+        """
+        self.qpane.interaction.registerSceneOverlay(name, draw_fn)
+
+    def unregisterSceneOverlay(self, name: str) -> None:
+        """Remove a previously registered scene overlay."""
+        self.qpane.interaction.unregisterSceneOverlay(name)
 
     def registerCursorProvider(self, mode: str, provider: CursorProvider) -> None:
         """Attach a provider that supplies cursors for the given control mode.

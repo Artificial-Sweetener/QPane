@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping
 import numpy as np
 from PySide6.QtCore import (
     QEvent,
+    QLineF,
     QPoint,
     QPointF,
     QRect,
@@ -36,6 +37,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QImage,
+    QPainter,
     QScreen,
     QWheelEvent,
     QWindow,
@@ -43,9 +45,20 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from . import ui
-from .cache import CacheCoordinator, cache_detail_provider
+from .cache import (
+    CacheCoordinator,
+    cache_detail_provider,
+)
 from .cache.registry import CacheRegistry
 from .catalog import Catalog, CatalogMutationEvent, ImageCatalog, ImageMap, LinkManager
+from .compare import (
+    CompareDividerInteraction,
+    CompareService,
+    ComparisonChange,
+    ComparisonChangeKind,
+)
+from .composition import CompositionKind, CompositionRecord, CompositionService
+from .composition.scene_adapter import CompositionSceneAdapter
 from .concurrency import TaskExecutorProtocol, ThreadPolicy
 from .core import (
     Config,
@@ -56,6 +69,7 @@ from .core import (
     OverlayDrawFn,
     QPaneHooks,
     QPaneState,
+    SceneOverlayDrawFn,
     ToolFactory,
     ToolSignalBinder,
 )
@@ -63,12 +77,35 @@ from .core.diagnostics_broker import Diagnostics
 from .masks.workflow import MaskActivationSyncResult, MaskInfo, Masks
 from .rendering import (
     RenderingPresenter,
-    RenderState,
     View,
     ViewportZoomMode,
 )
 from .rendering.coordinates import PanelHitTest
-from .types import CatalogEntry, CatalogSnapshot, DiagnosticsDomain, LinkedGroup
+from .scene.identity import base_image_layer_id
+from .scene.mask_adapter import MaskServiceSceneProvider
+from .scene.mutations import SceneMutationCoordinator
+from .scene.registry import (
+    CatalogLayerSourceResolver,
+    LayerSourceResolverRegistry,
+    SceneProviderRegistry,
+)
+from .scene.render_plan import RasterLayerRenderItem, SceneLayerHitTestResult
+from .types import (
+    CatalogEntry,
+    CatalogSnapshot,
+    ComparisonDividerState,
+    ComparisonOrientation,
+    ComparisonState,
+    CompositionSnapshot,
+    DiagnosticsDomain,
+    LinkedGroup,
+    QPaneSceneLayer,
+    QPaneSceneRequest,
+    QPaneSceneTemplate,
+    QPaneSceneTemplateBindings,
+    QPaneScene,
+    QPaneSceneHit,
+)
 from .swap import SwapDelegate
 from .tools import Tools
 from .tools.base import ExtensionTool, ExtensionToolSignals
@@ -122,6 +159,14 @@ class QPane(QWidget):
     """Emit overlay visibility state when the diagnostics HUD toggles."""
     diagnosticsDomainToggled: Signal = Signal(str, bool)
     """Emit diagnostics domain ID and enabled state after detail toggles."""
+    comparisonChanged: Signal = Signal(object)
+    """Emit the comparison state after comparison rendering changes."""
+    compositionChanged: Signal = Signal(object)
+    """Emit the composition snapshot after composition records change."""
+    compositionSelectionChanged: Signal = Signal(object)
+    """Emit the active composition UUID or ``None`` when selection changes."""
+    sceneChanged: Signal = Signal(object)
+    """Emit the normalized active scene snapshot or ``None`` when it changes."""
     samCheckpointStatusChanged: Signal = Signal(str, object)
     """Emit checkpoint status and path updates for SAM readiness tracking.
     The payload is ``(status, path)``, where ``path`` is a ``Path`` and status
@@ -170,6 +215,14 @@ class QPane(QWidget):
         self._hooks = QPaneHooks(self)
         self._view: View | None = None
         self._catalog: Catalog | None = None
+        self._composition_service: CompositionService | None = None
+        self.compare_service: CompareService | None = None
+        self._compare_interaction: CompareDividerInteraction | None = None
+        self._composition_scene_adapter: CompositionSceneAdapter | None = None
+        self._scene_mutations: SceneMutationCoordinator | None = None
+        self._scene_provider_registry: SceneProviderRegistry | None = None
+        self._source_resolver_registry: LayerSourceResolverRegistry | None = None
+        self._mask_scene_provider: MaskServiceSceneProvider | None = None
         self._masks: Masks | None = None
         self._tools: Tools | None = None
         self._is_blank = False
@@ -210,6 +263,49 @@ class QPane(QWidget):
         """Build an ImageMap of CatalogEntry values from aligned iterables via the shared helper."""
         return Catalog.imageMapFromLists(images, paths=paths, ids=ids)
 
+    @staticmethod
+    def fitSceneRect(source_size: QSize, target_rect: QRectF) -> QRectF:
+        """Return the largest centered aspect-preserving scene rect inside a target.
+
+        Args:
+            source_size: Source image size whose aspect ratio should be preserved.
+            target_rect: Scene-coordinate slot that should contain the result.
+
+        Returns:
+            A detached ``QRectF`` centered inside ``target_rect``.
+
+        Raises:
+            ValueError: If ``source_size`` is empty or ``target_rect`` has
+                negative dimensions.
+        """
+        return QPane._aspect_scene_rect(
+            source_size,
+            target_rect,
+            cover=False,
+        )
+
+    @staticmethod
+    def fillSceneRect(source_size: QSize, target_rect: QRectF) -> QRectF:
+        """Return the smallest centered aspect-preserving scene rect covering a target.
+
+        Args:
+            source_size: Source image size whose aspect ratio should be preserved.
+            target_rect: Scene-coordinate slot that should be covered.
+
+        Returns:
+            A detached ``QRectF`` centered on ``target_rect``. The result may
+            extend outside ``target_rect``.
+
+        Raises:
+            ValueError: If ``source_size`` is empty or ``target_rect`` has
+                negative dimensions.
+        """
+        return QPane._aspect_scene_rect(
+            source_size,
+            target_rect,
+            cover=True,
+        )
+
     @property
     def settings(self) -> Config:
         """Expose the active configuration snapshot managed by QPaneState."""
@@ -235,8 +331,8 @@ class QPane(QWidget):
         return self.catalog().placeholderActive()
 
     @property
-    def currentImage(self) -> QImage:
-        """Return the image currently displayed in this QPane."""
+    def currentImage(self) -> QImage | None:
+        """Return the selected catalog image, or None when absent."""
         catalog = self.catalog()
         return catalog.currentImage()
 
@@ -279,22 +375,42 @@ class QPane(QWidget):
         """Return link groups paired with their stable identifiers via the facade."""
         return self.linkManager().getGroupRecords()
 
+    def currentCompositionID(self) -> uuid.UUID | None:
+        """Return the active composition UUID."""
+        return self.compositionService().current_composition_id()
+
+    def compositionIDs(self) -> list[uuid.UUID]:
+        """Return composition UUIDs in browser order."""
+        return list(self.compositionService().composition_ids())
+
+    def getCompositionSnapshot(self) -> CompositionSnapshot:
+        """Return a structured snapshot of composition browser state."""
+        return self.compositionService().snapshot()
+
     def activeMaskID(self) -> uuid.UUID | None:
         """Return the active mask identifier when masking is available."""
+        if self._active_layered_scene_composition():
+            return None
         return self._masks_controller.getActiveMaskID()
 
     def maskIDsForImage(self, image_id: uuid.UUID | None = None) -> list[uuid.UUID]:
         """Return mask identifiers associated with ``image_id``."""
+        if image_id is None and self._active_layered_scene_composition():
+            return []
         return self._masks_controller.maskIDsForImage(image_id)
 
     def listMasksForImage(
         self, image_id: uuid.UUID | None = None
     ) -> tuple[MaskInfo, ...]:
         """Return mask metadata entries for ``image_id`` when masking is available."""
+        if image_id is None and self._active_layered_scene_composition():
+            return ()
         return self._masks_controller.listMasksForImage(image_id)
 
     def getActiveMaskImage(self) -> QImage | None:
         """Return the QImage for the currently active mask layer."""
+        if self._active_layered_scene_composition():
+            return None
         return self._masks_controller.get_active_mask_image()
 
     def getMaskUndoState(self, mask_id: uuid.UUID) -> "MaskUndoState | None":
@@ -454,7 +570,7 @@ class QPane(QWidget):
         name: str,
         draw_fn: OverlayDrawFn,
     ) -> None:
-        """Register a content-space overlay to be painted after the base image.
+        """Register a content-space overlay to be painted after rendered content.
 
         Raises:
             ValueError: If `name` is already present.
@@ -469,8 +585,109 @@ class QPane(QWidget):
         self.interaction.unregisterOverlay(name)
 
     def contentOverlays(self) -> Mapping[str, OverlayDrawFn]:
-        """Return the current overlay registry maintained by the interaction layer."""
-        return self.interaction.content_overlays
+        """Return a read-only snapshot of registered content overlays."""
+        return self.interaction.content_overlays_snapshot()
+
+    def composeScene(
+        self,
+        request: QPaneSceneRequest,
+        *,
+        activate: bool = True,
+        fit_view: bool = True,
+    ) -> uuid.UUID:
+        """Create or replace a stored catalog-backed scene composition.
+
+        Args:
+            request: Scene composition request whose layers reference catalog image IDs.
+            activate: Open the stored composition immediately when True.
+            fit_view: Fit the composed scene bounds when activation occurs.
+
+        Raises:
+            TypeError: If request objects have invalid types.
+            ValueError: If scene geometry, layer values, or replacement targets are invalid.
+            KeyError: If a layer references an image ID outside the catalog.
+
+        Side effects:
+            Stores a composition record, optionally opens it, and emits
+            composition and scene signals.
+        """
+        previous_active_id = self.currentCompositionID()
+        record = self.compositionService().compose_scene(
+            request,
+            catalog_contains=self._image_catalog.containsImage,
+            activate=activate,
+        )
+        self._emit_composition_changed()
+        if activate:
+            self._open_composition_record(record, fit_view=fit_view)
+        elif record.composition_id == previous_active_id:
+            self._refresh_active_scene_content(fit_view=fit_view)
+        return record.composition_id
+
+    def composeSceneFromTemplate(
+        self,
+        template: QPaneSceneTemplate,
+        bindings: QPaneSceneTemplateBindings,
+        *,
+        activate: bool = True,
+        fit_view: bool = True,
+    ) -> uuid.UUID:
+        """Create or replace a stored scene composition from a host template.
+
+        Args:
+            template: Host-owned reusable template object.
+            bindings: Catalog image bindings for this composition instance.
+            activate: Open the stored composition immediately when True.
+            fit_view: Fit the composed scene bounds when activation occurs.
+
+        Side effects:
+            Stores a composition record, optionally opens it, and emits
+            composition and scene signals.
+        """
+        previous_active_id = self.currentCompositionID()
+        record = self.compositionService().compose_scene_from_template(
+            template,
+            bindings,
+            catalog_contains=self._image_catalog.containsImage,
+            activate=activate,
+        )
+        self._emit_composition_changed()
+        if activate:
+            self._open_composition_record(record, fit_view=fit_view)
+        elif record.composition_id == previous_active_id:
+            self._refresh_active_scene_content(fit_view=fit_view)
+        return record.composition_id
+
+    def currentScene(self) -> QPaneScene | None:
+        """Return the normalized scene snapshot for the active composition."""
+        return self._current_scene_snapshot()
+
+    def sceneHitTest(self, panel_pos: QPoint) -> QPaneSceneHit | None:
+        """Return scene-layer hit metadata for ``panel_pos``."""
+        adapter = self._composition_scene_adapter
+        if adapter is None:
+            return None
+        return adapter.hit_from_result(self.view().scene_hit_test(panel_pos))
+
+    def registerSceneOverlay(
+        self,
+        name: str,
+        draw_fn: SceneOverlayDrawFn,
+    ) -> None:
+        """Register a scene overlay painted relative to layered scene composition layers.
+
+        Raises:
+            ValueError: If `name` is already present.
+        """
+        self.interaction.registerSceneOverlay(name, draw_fn)
+
+    def unregisterSceneOverlay(self, name: str) -> None:
+        """Remove a previously registered scene overlay."""
+        self.interaction.unregisterSceneOverlay(name)
+
+    def sceneOverlays(self) -> Mapping[str, SceneOverlayDrawFn]:
+        """Return a read-only snapshot of registered scene overlays."""
+        return self.interaction.scene_overlays_snapshot()
 
     def overlaysSuspended(self) -> bool:
         """Return True when interaction-managed overlays are currently suppressed."""
@@ -538,21 +755,30 @@ class QPane(QWidget):
         """Replace the catalog contents and navigate to ``current_id`` via the facade."""
         catalog = self.catalog()
         catalog.setImagesByID(image_map, current_id)
+        self._sync_compositions_with_catalog()
+        if current_id in self.catalog().imageIDs():
+            self._activate_default_composition_for_image(current_id)
 
     def clearImages(self):
         """Reset the catalog, linked views, and caches before showing the configured placeholder."""
         catalog = self.catalog()
         catalog.clearImages()
+        if self.compositionService().clear():
+            self._emit_composition_changed()
+            self._emit_composition_selection_changed(None)
+            self._emit_scene_changed()
 
     def removeImageByID(self, image_id: uuid.UUID):
         """Remove ``image_id`` when present; callers remain responsible for navigation."""
         catalog = self.catalog()
         catalog.removeImageByID(image_id)
+        self._sync_compositions_with_catalog()
 
     def removeImagesByID(self, image_ids: list[uuid.UUID]):
         """Remove the provided image IDs when present without selecting a fallback."""
         catalog = self.catalog()
         catalog.removeImagesByID(image_ids)
+        self._sync_compositions_with_catalog()
 
     def setCurrentImageID(self, image_id: uuid.UUID | None):
         """Navigate to ``image_id`` while overlays are suspended for navigation.
@@ -564,7 +790,13 @@ class QPane(QWidget):
         catalog = self.catalog()
         catalog.setCurrentImageID(image_id)
         if image_id is None:
+            if self.compositionService().clear_selection():
+                self._emit_composition_selection_changed(None)
+                self._emit_scene_changed()
             self._emit_catalog_selection_changed(None)
+            self._handle_comparison_changed()
+        elif catalog.currentImageID() == image_id:
+            self._activate_default_composition_for_image(image_id)
 
     def setAllImagesLinked(self, enabled: bool):
         """Toggle pan/zoom synchronization across all images."""
@@ -593,6 +825,84 @@ class QPane(QWidget):
         """
         self.linkManager().setGroups(tuple(groups))
         self._maybe_emit_link_groups_changed()
+
+    def compose(
+        self,
+        *,
+        images: Iterable[uuid.UUID],
+        title: str | None = None,
+    ) -> uuid.UUID:
+        """Create and open a persistent composition from catalog image IDs.
+
+        Args:
+            images: One or two catalog image UUIDs in composition order.
+            title: Optional host-facing title.
+
+        Raises:
+            KeyError: If any image ID is not in the catalog.
+            ValueError: If the image list is empty, too long, or duplicated.
+
+        Side effects:
+            Opens the new composition, updates catalog selection to its base
+            image, emits composition signals, and refreshes comparison state.
+        """
+        image_ids = tuple(images)
+        missing = [
+            image_id
+            for image_id in image_ids
+            if not self._image_catalog.containsImage(image_id)
+        ]
+        if missing:
+            raise KeyError("compose image IDs must exist in the catalog")
+        record = self.compositionService().compose(
+            image_ids,
+            title=title,
+            path_lookup=self.imagePath,
+        )
+        self._open_composition_record(record)
+        self._emit_composition_changed()
+        return record.composition_id
+
+    def openComposition(self, composition_id: uuid.UUID) -> None:
+        """Open an existing composition by UUID.
+
+        Args:
+            composition_id: Composition UUID returned by composition APIs.
+
+        Raises:
+            KeyError: If ``composition_id`` is unknown.
+            TypeError: If ``composition_id`` is not a UUID.
+
+        Side effects:
+            Updates the effective catalog selection and emits composition
+            selection/comparison state.
+        """
+        record = self.compositionService().open_composition(composition_id)
+        self._open_composition_record(record)
+
+    def removeComposition(self, composition_id: uuid.UUID) -> None:
+        """Remove an explicit composition.
+
+        Generated default catalog compositions are removed by removing their
+        catalog image instead.
+
+        Raises:
+            ValueError: If ``composition_id`` is a generated default composition.
+            KeyError: If ``composition_id`` is unknown.
+
+        Side effects:
+            Emits composition change signals and opens the next available
+            composition when the removed one was active.
+        """
+        service = self.compositionService()
+        previous_id = service.current_composition_id()
+        service.remove_composition(composition_id)
+        active = service.active_record()
+        if previous_id == composition_id and active is not None:
+            self._open_composition_record(active)
+        elif active is None:
+            self.setCurrentImageID(None)
+        self._emit_composition_changed()
 
     def getCatalogSnapshot(self) -> CatalogSnapshot:
         """Return a structured catalog snapshot for host consumption.
@@ -627,6 +937,7 @@ class QPane(QWidget):
         Side effects:
             Emits ``catalogChanged`` with ``maskCreated`` when a mask is created.
         """
+        self._raise_if_layered_scene_active("create a mask")
         mask_id = self._masks_controller.create_blank_mask(size)
         if mask_id is not None:
             self._emit_catalog_mutation("maskCreated", affected_ids=(mask_id,))
@@ -638,6 +949,7 @@ class QPane(QWidget):
         Side effects:
             Emits ``catalogChanged`` with ``maskImported`` when a mask is loaded.
         """
+        self._raise_if_layered_scene_active("load a mask")
         mask_id = self._masks_controller.load_mask_from_file(path)
         if mask_id is not None:
             self._emit_catalog_mutation("maskImported", affected_ids=(mask_id,))
@@ -658,6 +970,7 @@ class QPane(QWidget):
 
     def setActiveMaskID(self, mask_id):
         """Set the active mask for editing while letting the service manage ordering."""
+        self._raise_if_layered_scene_active("set the active mask")
         changed = self._masks_controller.set_active_mask_id(mask_id)
         if changed:
             current_id = None
@@ -690,23 +1003,29 @@ class QPane(QWidget):
     def prefetchMaskOverlays(
         self, image_id: uuid.UUID | None, *, reason: str = "navigation"
     ) -> bool:
-        """Request asynchronous warming of mask overlays for `image_id` when masking is available."""
+        """Request asynchronous warming of mask renders for `image_id` when masking is available."""
+        if image_id is None and self._active_layered_scene_composition():
+            return False
         return self._masks_controller.prefetch_mask_overlays(image_id, reason=reason)
 
     def cycleMasksForward(self):
         """Cycle the mask layer stack forward, moving the bottom layer to the top."""
+        self._raise_if_layered_scene_active("cycle masks")
         return self._masks_controller.cycle_masks_forward()
 
     def cycleMasksBackward(self):
         """Cycle the mask layer stack backward, moving the top layer to the bottom."""
+        self._raise_if_layered_scene_active("cycle masks")
         return self._masks_controller.cycle_masks_backward()
 
     def undoMaskEdit(self) -> bool:
         """Undo the last mask edit through the mask workflow."""
+        self._raise_if_layered_scene_active("undo a mask edit")
         return self._masks_controller.undo_mask_edit()
 
     def redoMaskEdit(self) -> bool:
         """Redo the last reverted mask edit through the mask workflow."""
+        self._raise_if_layered_scene_active("redo a mask edit")
         return self._masks_controller.redo_mask_edit()
 
     def setControlMode(
@@ -726,6 +1045,74 @@ class QPane(QWidget):
                 return
         self.interaction.set_control_mode(mode)
 
+    def setComparisonImageID(self, image_id: uuid.UUID) -> None:
+        """Use a catalog image as the comparison reveal source.
+
+        Args:
+            image_id: Catalog UUID to render as the comparison image.
+
+        Raises:
+            KeyError: If ``image_id`` is not in the catalog.
+            TypeError: If ``image_id`` is not a UUID.
+
+        Side effects:
+            Marks the rendered scene dirty and emits ``comparisonChanged``.
+        """
+        self._comparison_service().set_catalog_image(image_id)
+
+    def clearComparisonImage(self) -> None:
+        """Disable comparison rendering and repaint the current scene."""
+        self._comparison_service().clear()
+
+    def setComparisonSplit(
+        self,
+        position: float,
+        orientation: ComparisonOrientation | str | None = None,
+    ) -> None:
+        """Set the comparison reveal split.
+
+        Args:
+            position: Normalized split position from ``0.0`` to ``1.0``.
+            orientation: Optional split orientation.
+
+        Raises:
+            ValueError: If ``position`` is not numeric or orientation is unknown.
+
+        Side effects:
+            Marks the rendered scene dirty and emits ``comparisonChanged``.
+        """
+        self._comparison_service().set_split(position, orientation)
+
+    def comparisonState(self) -> ComparisonState:
+        """Return the current comparison rendering state."""
+        return self._comparison_service().state()
+
+    def comparisonDividerInteractive(self) -> bool:
+        """Return whether comparison-divider dragging is enabled."""
+        return self.comparisonDividerInteraction().interactive()
+
+    def setComparisonDividerInteractive(self, enabled: bool) -> None:
+        """Enable or disable built-in comparison-divider dragging.
+
+        Args:
+            enabled: Whether the split boundary should accept mouse drags while
+                comparison rendering is active.
+
+        Raises:
+            TypeError: If ``enabled`` is not a bool.
+
+        Side effects:
+            Clears any active divider drag, refreshes the cursor, and schedules a
+            repaint.
+        """
+        self.comparisonDividerInteraction().set_interactive(enabled)
+        self.refreshCursor()
+        self.update()
+
+    def comparisonDividerState(self) -> ComparisonDividerState:
+        """Return host-facing comparison divider geometry and interaction state."""
+        return self.comparisonDividerInteraction().state()
+
     # ========================================================================
     # Internal Implementation
     # ========================================================================
@@ -736,6 +1123,12 @@ class QPane(QWidget):
             raise AttributeError("Catalog accessed before initialization")
         return self._catalog
 
+    def compositionService(self) -> CompositionService:
+        """Expose the internal composition owner."""
+        if self._composition_service is None:
+            raise AttributeError("Composition service accessed before initialization")
+        return self._composition_service
+
     def view(self) -> View:
         """Expose the view collaborator that owns viewport, tile, and swap services."""
         if self._view is None:
@@ -745,6 +1138,42 @@ class QPane(QWidget):
     def presenter(self) -> RenderingPresenter:
         """Expose the RenderingPresenter managed by the rendering stack."""
         return self.view().presenter
+
+    def sceneMutationCoordinator(self) -> SceneMutationCoordinator:
+        """Expose internal scene mutation routing for feature workflows."""
+        coordinator = self._scene_mutations
+        if coordinator is None:
+            raise AttributeError(
+                "Scene mutation coordinator accessed before initialization"
+            )
+        return coordinator
+
+    def sceneProviderRegistry(self) -> SceneProviderRegistry:
+        """Expose private scene-provider registration for feature workflows."""
+        registry = self._scene_provider_registry
+        if registry is None:
+            raise AttributeError(
+                "Scene provider registry accessed before initialization"
+            )
+        return registry
+
+    def layerSourceResolverRegistry(self) -> LayerSourceResolverRegistry:
+        """Expose private layer-source resolution for rendering workflows."""
+        registry = self._source_resolver_registry
+        if registry is None:
+            raise AttributeError(
+                "Layer source resolver registry accessed before initialization"
+            )
+        return registry
+
+    def comparisonDividerInteraction(self) -> CompareDividerInteraction:
+        """Expose the internal comparison divider interaction owner."""
+        interaction = self._compare_interaction
+        if interaction is None:
+            raise AttributeError(
+                "Comparison divider interaction accessed before initialization"
+            )
+        return interaction
 
     def linkManager(self) -> LinkManager:
         """Expose the link manager coordinating linked-view groups."""
@@ -761,6 +1190,55 @@ class QPane(QWidget):
             controller = DiagnosticsOverlayController(self)
             self._diagnostics_overlay_controller = controller
         return controller
+
+    def _comparison_service(self) -> CompareService:
+        """Return the internal compare service."""
+        service = self.compare_service
+        if service is None:
+            raise AttributeError("Compare service accessed before initialization")
+        return service
+
+    @staticmethod
+    def _aspect_scene_rect(
+        source_size: QSize,
+        target_rect: QRectF,
+        *,
+        cover: bool,
+    ) -> QRectF:
+        """Return an aspect-preserving rectangle centered on ``target_rect``."""
+        source_width = float(source_size.width())
+        source_height = float(source_size.height())
+        if source_width <= 0.0 or source_height <= 0.0:
+            raise ValueError("source_size dimensions must be positive")
+        target = QRectF(target_rect)
+        target_width = float(target.width())
+        target_height = float(target.height())
+        if target_width < 0.0 or target_height < 0.0:
+            raise ValueError("target_rect dimensions must be non-negative")
+        center = target.center()
+        if target_width == 0.0 or target_height == 0.0:
+            return QRectF(center.x(), center.y(), 0.0, 0.0)
+        source_aspect = source_width / source_height
+        target_aspect = target_width / target_height
+        use_target_width = (
+            target_aspect > source_aspect if cover else target_aspect <= source_aspect
+        )
+        if use_target_width:
+            width = target_width
+            height = width / source_aspect
+        else:
+            height = target_height
+            width = height * source_aspect
+        return QRectF(
+            center.x() - width / 2.0,
+            center.y() - height / 2.0,
+            width,
+            height,
+        )
+
+    def _scene_hit_test(self, panel_pos: QPoint) -> SceneLayerHitTestResult | None:
+        """Return private scene-layer hit-test metadata for ``panel_pos``."""
+        return self.view().scene_hit_test(panel_pos)
 
     @property
     def executor(self) -> TaskExecutorProtocol:
@@ -803,10 +1281,15 @@ class QPane(QWidget):
         """Initialize core viewer components that do not require optional features."""
         self._state.cache_coordinator = self._state.build_cache_coordinator()
         self._state.cache_registry = CacheRegistry(self._state.cache_coordinator)
+        self._scene_provider_registry = SceneProviderRegistry()
+        self._source_resolver_registry = LayerSourceResolverRegistry()
         self._image_catalog = ImageCatalog(
             config=self.settings,
             executor=self.executor,
             parent=self,
+        )
+        self.layerSourceResolverRegistry().register(
+            CatalogLayerSourceResolver(self._image_catalog)
         )
         view = View(
             qpane=self,
@@ -815,6 +1298,9 @@ class QPane(QWidget):
             executor=self.executor,
         )
         self._view = view
+        self._scene_mutations = SceneMutationCoordinator(
+            scene_provider=view.current_scene_descriptor
+        )
         self._catalog = Catalog(
             catalog=self._image_catalog,
             controller=view.catalog_controller,
@@ -822,6 +1308,25 @@ class QPane(QWidget):
             swap_delegate=view.swap_delegate,
             qpane=self,
         )
+        self._composition_service = CompositionService()
+        self._composition_scene_adapter = CompositionSceneAdapter(
+            compositions=self._composition_service,
+            catalog=self._image_catalog,
+        )
+        self.sceneProviderRegistry().register_replacement(
+            self._composition_scene_adapter
+        )
+        self.compare_service = CompareService(
+            catalog=self._image_catalog,
+            compositions=self._composition_service,
+            changed_callback=self._handle_comparison_changed,
+        )
+        self._compare_interaction = CompareDividerInteraction(
+            qpane=self,
+            service=self.compare_service,
+        )
+        self.sceneProviderRegistry().register_geometry_adapter(self.compare_service)
+        self.sceneProviderRegistry().register_contribution(self.compare_service)
         self._tools = Tools(parent=self)
         self.cursor_builder = CursorBuilder()
         # Placeholders for optional subsystems; installed by feature hooks.
@@ -946,6 +1451,9 @@ class QPane(QWidget):
             Emits ``catalogChanged`` with ``maskServiceAttached``.
         """
         self._masks_controller.attachMaskService(service)
+        provider = MaskServiceSceneProvider(service)
+        self.sceneProviderRegistry().register_contribution(provider)
+        self._mask_scene_provider = provider
         self._emit_catalog_mutation("maskServiceAttached", affected_ids=())
 
     def detachMaskService(self) -> None:
@@ -954,6 +1462,10 @@ class QPane(QWidget):
         Side effects:
             Emits ``catalogChanged`` with ``maskServiceDetached``.
         """
+        provider = self._mask_scene_provider
+        if provider is not None:
+            self.sceneProviderRegistry().unregister_contribution(provider)
+            self._mask_scene_provider = None
         self._masks_controller.detachMaskService()
         self._emit_catalog_mutation("maskServiceDetached", affected_ids=())
 
@@ -1024,7 +1536,7 @@ class QPane(QWidget):
         sub_mask_image: QImage | None = None,
         force_async_colorize: bool = False,
     ) -> bool:
-        """Forward mask-region updates to refresh cached overlays.
+        """Forward mask-region updates to refresh cached mask renders.
 
         Args:
             dirty_image_rect: Image-space rectangle that was modified.
@@ -1185,14 +1697,6 @@ class QPane(QWidget):
         """Return the zoom level where one image pixel equals one device pixel."""
         return self.view().viewport.nativeZoom()
 
-    def calculateRenderState(
-        self, *, use_pan: QPointF | None = None
-    ) -> RenderState | None:
-        """Expose the presenter's render-state calculation to collaborators."""
-        return self.view().calculateRenderState(
-            use_pan=use_pan, is_blank=self._is_blank
-        )
-
     def isDragOutAllowed(self) -> bool:
         """Return True when drag-out is enabled and the image fits the viewport."""
         catalog = self.catalog()
@@ -1200,12 +1704,15 @@ class QPane(QWidget):
             policy = catalog.placeholderPolicy()
             if policy is None or not getattr(policy, "drag_out_enabled", False):
                 return False
-            if self.original_image.isNull():
+            if not self.view().has_renderable_content():
                 return False
         if not getattr(self.settings, "drag_out_enabled", True):
             return False
+        content_snapshot = self.view().current_content_snapshot()
+        if content_snapshot is None:
+            return False
         return ui.is_drag_out_allowed(
-            image=self.original_image,
+            image_size=content_snapshot.base_image_size,
             zoom=self.view().viewport.zoom,
             zoom_mode=self.view().viewport.get_zoom_mode(),
             viewport_size=self.physicalViewportRect().size(),
@@ -1449,7 +1956,7 @@ class QPane(QWidget):
     def _can_apply_zoom(self) -> bool:
         """Return True when zoom updates are allowed for the current view."""
         viewport = self.view().viewport
-        if self.original_image.isNull():
+        if not self.view().has_renderable_content():
             logger.warning("applyZoom ignored because no image is loaded")
             return False
         if viewport.is_locked():
@@ -1470,8 +1977,318 @@ class QPane(QWidget):
 
     def _handle_catalog_mutation(self, event: CatalogMutationEvent) -> None:
         """Relay catalog mutations through the QPane signal surface."""
+        self.view().invalidate_content_cache()
+        removed_ids = self._removed_catalog_ids(event)
+        compositions_changed = self._sync_compositions_with_catalog()
+        compare = self.compare_service
+        if compare is not None:
+            if removed_ids:
+                compare.remove_catalog_images(removed_ids)
+            compare.reconcile_catalog()
+        affected_ids = set(event.affected_ids)
+        comparison_source_id = (
+            compare.state().source_id if compare is not None else None
+        )
+        if (
+            self.catalog().currentImageID() in affected_ids
+            or comparison_source_id in affected_ids
+        ):
+            self._sync_viewport_content_geometry()
+            self.view().mark_dirty(None)
+            self.update()
         self.catalogChanged.emit(event)
         self._maybe_emit_link_groups_changed()
+        if compositions_changed:
+            self._emit_composition_changed()
+
+    @staticmethod
+    def _removed_catalog_ids(event: CatalogMutationEvent) -> set[uuid.UUID]:
+        """Return affected IDs only for catalog mutations that remove entries."""
+        if event.reason in {"removeImageByID", "removeImagesByID", "clearImages"}:
+            return set(event.affected_ids)
+        return set()
+
+    def _handle_comparison_changed(
+        self,
+        change: ComparisonChange | None = None,
+    ) -> None:
+        """Refresh rendering and signals after comparison state changes."""
+        try:
+            self.view().invalidate_content_cache()
+            if change is None or change.kind in {
+                ComparisonChangeKind.SOURCE,
+                ComparisonChangeKind.ENABLED,
+            }:
+                self._sync_viewport_content_geometry()
+            if change is not None and change.kind == ComparisonChangeKind.SPLIT:
+                dirty_rect = self._comparison_split_dirty_rect(change)
+            else:
+                dirty_rect = None
+            self.view().mark_dirty(dirty_rect)
+        except Exception:  # pragma: no cover - defensive teardown guard
+            return
+        state = self._comparison_service().state()
+        if not state.enabled:
+            self.comparisonDividerInteraction().cancel_drag()
+        self.comparisonChanged.emit(state)
+        self.refreshCursor()
+        self.update()
+
+    def _comparison_split_dirty_rect(self, change: ComparisonChange) -> QRect | None:
+        """Return the bounded dirty rect for a pure comparison split change."""
+        previous = change.previous
+        current = change.current
+        if (
+            not previous.enabled
+            or not current.enabled
+            or previous.source_id != current.source_id
+            or previous.orientation != current.orientation
+        ):
+            return None
+        plan = self.view().calculateRenderPlan(
+            is_blank=getattr(self, "_is_blank", False)
+        )
+        if plan is None:
+            return None
+        compare_item = next(
+            (
+                item
+                for item in plan.render_items
+                if isinstance(item, RasterLayerRenderItem)
+                and item.descriptor.hit_test.role == "comparison-image"
+            ),
+            None,
+        )
+        if compare_item is None:
+            return None
+        previous_line = self._comparison_split_line(
+            compare_item,
+            plan.scene_bounds,
+            previous.split_position,
+            current.orientation,
+        )
+        current_line = self._comparison_split_line(
+            compare_item,
+            plan.scene_bounds,
+            current.split_position,
+            current.orientation,
+        )
+        if previous_line is None or current_line is None:
+            return None
+        bounds = QRectF(previous_line.p1(), previous_line.p2()).normalized()
+        bounds = bounds.united(
+            QRectF(current_line.p1(), current_line.p2()).normalized()
+        )
+        hit_width = self.comparisonDividerInteraction().state().hit_width
+        return bounds.adjusted(
+            -hit_width,
+            -hit_width,
+            hit_width,
+            hit_width,
+        ).toAlignedRect()
+
+    @staticmethod
+    def _comparison_split_line(
+        item: RasterLayerRenderItem,
+        scene_bounds,
+        split_position: float,
+        orientation: ComparisonOrientation,
+    ) -> QLineF | None:
+        """Project a normalized comparison split into widget coordinates."""
+        placement = item.placement
+        source_width = item.source_image.width()
+        source_height = item.source_image.height()
+        if (
+            source_width <= 0
+            or source_height <= 0
+            or placement.width <= 0.0
+            or placement.height <= 0.0
+        ):
+            return None
+        if orientation == ComparisonOrientation.HORIZONTAL:
+            scene_y = scene_bounds.y + scene_bounds.height * split_position
+            source_y = (scene_y - placement.y) * source_height / placement.height
+            source_line = QLineF(
+                QPointF(0.0, source_y),
+                QPointF(float(source_width), source_y),
+            )
+        else:
+            scene_x = scene_bounds.x + scene_bounds.width * split_position
+            source_x = (scene_x - placement.x) * source_width / placement.width
+            source_line = QLineF(
+                QPointF(source_x, 0.0),
+                QPointF(source_x, float(source_height)),
+            )
+        return QLineF(
+            item.transform.map(source_line.p1()),
+            item.transform.map(source_line.p2()),
+        )
+
+    def _sync_compositions_with_catalog(self) -> bool:
+        """Ensure composition records match the current catalog inventory."""
+        service = self.compositionService()
+        previous_id = service.current_composition_id()
+        changed = service.sync_catalog(
+            self.catalog().imageIDs(),
+            path_lookup=self.imagePath,
+        )
+        active = service.active_record()
+        current_id = self.catalog().currentImageID()
+        if active is None and current_id is not None:
+            try:
+                active = service.open_default_for_image(current_id)
+            except KeyError:
+                return changed
+            self._open_composition_record(active)
+            return True
+        current_composition_id = service.current_composition_id()
+        if current_composition_id != previous_id:
+            if active is not None:
+                self._open_composition_record(active)
+            else:
+                self._emit_composition_selection_changed(current_composition_id)
+                self._emit_scene_changed()
+        return changed
+
+    def _activate_default_composition_for_image(self, image_id: uuid.UUID) -> None:
+        """Open the generated default composition for a catalog image."""
+        service = self.compositionService()
+        previous_id = service.current_composition_id()
+        record = service.open_default_for_image(image_id)
+        if previous_id != record.composition_id:
+            self._emit_composition_selection_changed(record.composition_id)
+            self._handle_comparison_changed()
+            self._emit_scene_changed()
+
+    def _open_composition_record(
+        self,
+        record: CompositionRecord,
+        *,
+        fit_view: bool = True,
+    ) -> None:
+        """Apply a composition record to catalog selection and comparison state."""
+        if record.kind == CompositionKind.LAYERED_SCENE:
+            self._is_blank = False
+            self.view().invalidate_content_cache()
+            self._emit_composition_selection_changed(record.composition_id)
+            self._handle_comparison_changed()
+            self._sync_view_to_scene_bounds(fit_view=fit_view)
+            self._emit_scene_changed()
+            return
+        image_id = record.primary_image_id
+        if image_id is None:
+            self.setCurrentImageID(None)
+            return
+        if self.catalog().currentImageID() != image_id:
+            self.interaction.suspend_overlays_for_navigation()
+            self.catalog().setCurrentImageID(image_id)
+        self._emit_composition_selection_changed(record.composition_id)
+        self._handle_comparison_changed()
+        self._emit_scene_changed()
+
+    def _refresh_active_scene_content(self, *, fit_view: bool) -> None:
+        """Refresh rendering after the active scene payload changes in place."""
+        self.view().invalidate_content_cache()
+        self._sync_view_to_scene_bounds(fit_view=fit_view)
+        self._emit_scene_changed()
+
+    def _active_layered_scene_composition(self) -> bool:
+        """Return whether the active composition is a layered public scene."""
+        record = self.compositionService().active_record()
+        return record is not None and record.kind == CompositionKind.LAYERED_SCENE
+
+    def _raise_if_layered_scene_active(self, operation: str) -> None:
+        """Reject active-image mask operations while a layered scene is active."""
+        if self._active_layered_scene_composition():
+            raise RuntimeError(
+                f"cannot {operation} while a layered scene composition is active"
+            )
+
+    def _emit_composition_changed(self) -> None:
+        """Emit the latest composition snapshot."""
+        self.compositionChanged.emit(self.getCompositionSnapshot())
+
+    def _emit_composition_selection_changed(
+        self, composition_id: uuid.UUID | None
+    ) -> None:
+        """Emit composition selection changes for host browsers."""
+        self.compositionSelectionChanged.emit(composition_id)
+
+    def _emit_scene_changed(self) -> None:
+        """Emit the current normalized scene snapshot."""
+        self.sceneChanged.emit(self._current_scene_snapshot())
+
+    def _current_scene_snapshot(self) -> QPaneScene | None:
+        """Return a public scene snapshot for the active composition."""
+        service = self.compositionService()
+        scene = service.active_scene_snapshot()
+        if scene is not None:
+            return scene
+        record = service.active_record()
+        if record is None or record.primary_image_id is None:
+            return None
+        image = self._image_catalog.getImage(record.primary_image_id)
+        if image is None or image.isNull():
+            return None
+        bounds = QRectF(0.0, 0.0, float(image.width()), float(image.height()))
+        return QPaneScene(
+            composition_id=record.composition_id,
+            scene_id=record.composition_id,
+            title=record.title,
+            bounds=bounds,
+            layers=(
+                QPaneSceneLayer(
+                    layer_id=base_image_layer_id(record.primary_image_id),
+                    image_id=record.primary_image_id,
+                    placement=bounds,
+                    visible=True,
+                    opacity=1.0,
+                    clip=None,
+                    hit_test=True,
+                    role="base-image",
+                    metadata={},
+                ),
+            ),
+        )
+
+    def _handle_internal_scene_content_changed(
+        self, dirty_rect: QRect | QRectF | None = None
+    ) -> None:
+        """Refresh rendering after private scene content changes."""
+        try:
+            self.view().mark_dirty(dirty_rect)
+        except Exception:  # pragma: no cover - defensive teardown guard
+            return
+        self.update()
+
+    def _sync_view_to_scene_bounds(self, *, fit_view: bool) -> None:
+        """Refresh viewport geometry after private scene layout changes."""
+        view = self.view()
+        snapshot = view.current_content_snapshot()
+        if snapshot is None:
+            return
+        view.viewport.setContentSize(snapshot.base_image_size)
+        if fit_view:
+            view.viewport.setZoomFit()
+        self.setMinimumSize(self.minimumSizeHint())
+        view.allocate_buffers()
+        view.mark_dirty()
+        view.ensure_view_alignment(force=True)
+        self.update()
+
+    def _sync_viewport_content_geometry(self) -> None:
+        """Refresh viewport content size after renderable scene geometry changes."""
+        view = self.view()
+        snapshot = view.current_content_snapshot()
+        if snapshot is None:
+            return
+        viewport = view.viewport
+        viewport.setContentSize(snapshot.base_image_size)
+        if viewport.get_zoom_mode() == ViewportZoomMode.FIT:
+            viewport.setZoomFit()
+        else:
+            viewport.setPan(viewport.pan)
+        self.setMinimumSize(self.minimumSizeHint())
 
     def _emit_catalog_mutation(
         self, reason: str, *, affected_ids: Iterable[uuid.UUID] | None = None
@@ -1541,10 +2358,15 @@ class QPane(QWidget):
         presenter.paint(
             is_blank=self._is_blank,
             content_overlays=self.interaction.content_overlays,
+            scene_overlays=self.interaction.scene_overlays,
             overlays_suspended=self.interaction.overlays_suspended,
-            draw_tool_overlay=self._tools_manager.draw_overlay,
+            draw_tool_overlay=self._draw_interaction_overlays,
         )
         self.interaction.maybe_resume_overlays()
+
+    def _draw_interaction_overlays(self, painter: QPainter) -> None:
+        """Draw the active tool overlay."""
+        self._tools_manager.draw_overlay(painter)
 
     def wheelEvent(self, event: QWheelEvent):
         """Route wheel events to the interaction layer for gesture handling."""

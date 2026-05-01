@@ -98,8 +98,11 @@ def install_mask_feature(qpane: "QPane") -> None:
     controller = service.controller
 
     def _handle_mask_updated(mask_id, rect=None):
-        """Mark the QPane dirty when masks change so overlays redraw."""
-        qpane.markDirty(dirty_rect=rect)
+        """Mark the QPane dirty when mask scene content changes."""
+        if rect is None or rect.isNull() or rect.isEmpty():
+            qpane.markDirty()
+        else:
+            qpane.markDirty(dirty_rect=rect)
         qpane.update()
 
     tm_signals = qpane._tools_manager.signals

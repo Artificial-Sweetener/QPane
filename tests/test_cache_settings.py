@@ -17,6 +17,7 @@
 """Tests for cache settings normalization and overrides."""
 
 from __future__ import annotations
+import json
 import pytest
 import logging
 import qpane.core.config as cache_config_module
@@ -105,6 +106,11 @@ def test_config_as_dict_preserves_cache_fields() -> None:
     assert "cache" in data
     assert "prefetch" in data["cache"]
     assert data["cache"]["mode"] in {"auto", "hard"}
+
+
+def test_config_as_dict_is_json_serializable() -> None:
+    """Config snapshots should contain only JSON-serializable primitives."""
+    json.dumps(Config().as_dict())
 
 
 def test_cache_settings_resolved_budgets_apply_overrides() -> None:

@@ -24,7 +24,7 @@ from types import MethodType
 import numpy as np
 import pytest
 from PySide6.QtCore import QCoreApplication, QPoint, QPointF, QRect
-from PySide6.QtGui import QImage, QPainter, QPen, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform, Qt
 
 from qpane.catalog import NavigationEvent
 from qpane.catalog.image_utils import (
@@ -60,6 +60,13 @@ def _cleanup_qpane(qpane, qapp):
     qapp.processEvents()
 
 
+def _current_image_size(qpane):
+    """Return the active image size for tests that prepare a selected image."""
+    image = qpane.currentImage
+    assert image is not None
+    return image.size()
+
+
 def _make_test_qpane(qapp):
     executor = StubExecutor(auto_finish=True)
     qpane = QPane(task_executor=executor, features=())
@@ -84,6 +91,31 @@ def _make_test_qpane(qapp):
     )
     qpane.attachMaskService(service)
     return qpane, mask_manager, service
+
+
+class _RecordingMaskPainter:
+    """Painter stub that records mask overlay draw operations."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def save(self) -> None:
+        self.calls.append(("save", None))
+
+    def restore(self) -> None:
+        self.calls.append(("restore", None))
+
+    def setTransform(self, transform: QTransform) -> None:
+        self.calls.append(("transform", transform))
+
+    def setRenderHint(self, hint, enabled: bool) -> None:
+        self.calls.append(("hint", (hint, enabled)))
+
+    def setOpacity(self, opacity: float) -> None:
+        self.calls.append(("opacity", opacity))
+
+    def drawPixmap(self, x: int, y: int, pixmap) -> None:
+        self.calls.append(("draw", (x, y, pixmap)))
 
 
 def _masks(qpane: QPane):
@@ -148,6 +180,133 @@ def test_mask_workflow_signal_relays(qpane_with_mask):
         qpane.maskUndoStackChanged.disconnect(undo_slot)
     assert saved_payload and saved_payload[-1] == ("mask-id", "path.png")
     assert undo_payload
+
+
+def test_mask_manager_order_matches_current_overlay_order(qapp):
+    manager = MaskManager()
+    image_id = uuid.uuid4()
+    mask_image = QImage(8, 8, QImage.Format_Grayscale8)
+    mask_image.fill(0)
+    bottom = manager.create_mask(mask_image)
+    middle = manager.create_mask(mask_image)
+    top = manager.create_mask(mask_image)
+    for mask_id in (bottom, middle, top):
+        manager.associate_mask_with_image(mask_id, image_id)
+    assert manager.get_mask_ids_for_image(image_id) == [bottom, middle, top]
+    assert manager.get_masks_for_image(image_id) == [
+        manager.get_layer(bottom),
+        manager.get_layer(middle),
+        manager.get_layer(top),
+    ]
+    assert manager.reorder_mask(image_id, bottom, 2) is True
+    assert manager.get_mask_ids_for_image(image_id) == [middle, top, bottom]
+    assert manager.reorder_mask(image_id, bottom, 0) is True
+    assert manager.get_mask_ids_for_image(image_id) == [bottom, middle, top]
+
+
+def test_mask_feature_does_not_register_internal_mask_overlay(qapp):
+    qpane, _image = _prepare_qpane_with_mask_feature()
+    try:
+        assert "mask" not in qpane.interaction.content_overlays
+    finally:
+        _cleanup_qpane(qpane, qapp)
+
+
+def test_mask_opacity_change_does_not_invalidate_colorized_cache(
+    monkeypatch, qpane_with_mask
+):
+    qpane, mask_manager, _image_id = qpane_with_mask
+    service = _mask_service(qpane)
+    controller = service.controller
+    mask_id = qpane.createBlankMask(_current_image_size(qpane))
+    assert mask_id is not None
+    layer = mask_manager.get_layer(mask_id)
+    assert layer is not None
+    invalidated: list[object] = []
+    original_invalidate = controller._invalidate_colorized_mask_cache
+
+    def tracking_invalidate(mask_layer, *args, **kwargs):
+        invalidated.append(mask_layer)
+        return original_invalidate(mask_layer, *args, **kwargs)
+
+    monkeypatch.setattr(
+        controller,
+        "_invalidate_colorized_mask_cache",
+        tracking_invalidate,
+    )
+    assert qpane.setMaskProperties(mask_id, opacity=0.8) is True
+    assert invalidated == []
+
+
+def test_mask_property_empty_update_marks_full_scene_dirty(monkeypatch, qapp):
+    qpane, _image = _prepare_qpane_with_mask_feature()
+    try:
+        mask_id = qpane.createBlankMask(_current_image_size(qpane))
+        assert mask_id is not None
+        dirty_calls: list[object] = []
+
+        def tracking_mark_dirty(dirty_rect=None):
+            """Record renderer dirty-region requests."""
+            dirty_calls.append(dirty_rect)
+
+        monkeypatch.setattr(qpane, "markDirty", tracking_mark_dirty)
+
+        assert qpane.setMaskProperties(mask_id, opacity=0.8) is True
+        assert dirty_calls == [None]
+
+        dirty_calls.clear()
+        assert qpane.setMaskProperties(mask_id, color=QColor("cyan")) is True
+        assert dirty_calls == [None]
+    finally:
+        _cleanup_qpane(qpane, qapp)
+
+
+def test_mask_opacity_updates_route_through_scene_mutations(
+    monkeypatch, qpane_with_mask
+):
+    qpane, _mask_manager, _image_id = qpane_with_mask
+    service = _mask_service(qpane)
+    mask_id = qpane.createBlankMask(_current_image_size(qpane))
+    assert mask_id is not None
+    calls: list[tuple[uuid.UUID, float]] = []
+    original = service.applySceneMaskOpacity
+
+    def tracking_opacity(target_mask_id: uuid.UUID, opacity: float) -> bool:
+        """Record scene-routed opacity updates."""
+        calls.append((target_mask_id, opacity))
+        return original(target_mask_id, opacity)
+
+    monkeypatch.setattr(service, "applySceneMaskOpacity", tracking_opacity)
+
+    assert qpane.setMaskProperties(mask_id, opacity=0.8) is True
+
+    assert calls == [(mask_id, 0.8)]
+
+
+def test_mask_cycle_routes_reorder_through_scene_mutations(
+    monkeypatch, qpane_with_mask
+):
+    qpane, _mask_manager, image_id = qpane_with_mask
+    service = _mask_service(qpane)
+    image_size = _current_image_size(qpane)
+    first_id = qpane.createBlankMask(image_size)
+    second_id = qpane.createBlankMask(image_size)
+    assert first_id is not None and second_id is not None
+    calls: list[tuple[uuid.UUID, int]] = []
+    original = service.applySceneMaskReorder
+
+    def tracking_reorder(target_mask_id: uuid.UUID, target_index: int) -> bool:
+        """Record scene-routed reorder updates."""
+        calls.append((target_mask_id, target_index))
+        return original(target_mask_id, target_index)
+
+    monkeypatch.setattr(service, "applySceneMaskReorder", tracking_reorder)
+
+    assert qpane.maskIDsForImage(image_id) == [first_id, second_id]
+    assert qpane.cycleMasksForward() is True
+
+    assert calls == [(first_id, 2)]
+    assert qpane.maskIDsForImage(image_id) == [second_id, first_id]
 
 
 def test_qpane_brush_wrapper_delegates(monkeypatch, qapp):
@@ -1277,7 +1436,7 @@ def test_mask_reorder_commit_targets_active_layer(qpane_with_mask):
     service.controller.recordStrokePatchFromArrays(mask_a, dirty_rect, before, after)
     assert service.controller.commitStroke(mask_a)
     mask_a_snapshot = layer_a.mask_image.copy()
-    mask_manager.cycle_mask_order(image_id, forward=True)
+    assert mask_manager.reorder_mask(image_id, mask_a, 0)
     assert qpane.setActiveMaskID(mask_b)
     after_b = before.copy()
     after_b[1, 6] = 255
@@ -1601,13 +1760,15 @@ def test_mask_patch_undo_updates_overlay_cache_in_place(qpane_with_mask):
     service.updateMaskRegion(QRect(0, 0, 1, 1), layer)
     pixmap = service.getColorizedMask(layer)
     assert pixmap is not None
-    cache_key = (id(layer), None)
+    cache_key = controller._cache_key(mask_id, None)
     cached_pixmap = controller._colorized_mask_cache.get(cache_key)
     assert cached_pixmap is pixmap
     assert pixmap.toImage().pixelColor(0, 0).alpha() > 0
     assert service.undoActiveMaskEdit()
-    pixmap_after = controller._colorized_mask_cache.get(cache_key)
-    assert pixmap_after is cached_pixmap
+    assert controller._colorized_mask_cache.get(cache_key) is None
+    pixmap_after = service.getColorizedMask(layer)
+    assert pixmap_after is not None
+    assert pixmap_after is not cached_pixmap
     assert pixmap_after.toImage().pixelColor(0, 0).alpha() == 0
     assert layer.mask_image.pixelColor(0, 0).value() == 0
 
@@ -1630,13 +1791,15 @@ def test_mask_image_command_undo_updates_overlay_cache(qpane_with_mask):
     service.updateMaskRegion(layer.mask_image.rect(), layer)
     pixmap = service.getColorizedMask(layer)
     assert pixmap is not None
-    cache_key = (id(layer), None)
+    cache_key = controller._cache_key(mask_id, None)
     cached_pixmap = controller._colorized_mask_cache.get(cache_key)
     assert cached_pixmap is pixmap
     assert pixmap.toImage().pixelColor(0, 0).alpha() > 0
     assert service.undoActiveMaskEdit()
-    pixmap_after = controller._colorized_mask_cache.get(cache_key)
-    assert pixmap_after is cached_pixmap
+    assert controller._colorized_mask_cache.get(cache_key) is None
+    pixmap_after = service.getColorizedMask(layer)
+    assert pixmap_after is not None
+    assert pixmap_after is not cached_pixmap
     assert pixmap_after.toImage().pixelColor(0, 0).alpha() == 0
     assert layer.mask_image.pixelColor(0, 0).value() == 0
 
@@ -1899,7 +2062,7 @@ def test_mask_prefetch_warms_masks(qapp):
         assert metrics.entry_count >= 1
         scale_key = controller._normalize_scale_key(0.25)
         if scale_key is not None:
-            cache_key = (id(layer), scale_key)
+            cache_key = controller._cache_key(mask_id, scale_key)
             assert cache_key in controller._colorized_mask_cache
             scaled_pixmap = controller._colorized_mask_cache[cache_key]
             assert scaled_pixmap.size() == controller._target_scaled_size(
@@ -2123,7 +2286,7 @@ def test_prefetched_scaled_overlay_reused_after_eviction(qpane_with_mask):
     )
     scale_key = controller._normalize_scale_key(scale_value)
     assert scale_key is not None
-    controller._colorized_mask_cache.pop((id(layer), scale_key))
+    controller._colorized_mask_cache.pop(controller._cache_key(mask_id, scale_key))
     metrics_before = controller.snapshot_metrics()
     pixmap = controller.get_colorized_mask(layer, scale=scale_value)
     assert pixmap is not None
@@ -2239,8 +2402,8 @@ def test_scaled_mask_cache_populates_scaled_entry_first(qpane_with_mask):
     assert scale_key is not None
     pixmap = controller.get_colorized_mask(layer, scale=scale_value)
     assert pixmap is not None
-    scaled_entry = (id(layer), scale_key)
-    base_entry = (id(layer), None)
+    scaled_entry = controller._cache_key(mask_id, scale_key)
+    base_entry = controller._cache_key(mask_id, None)
     assert scaled_entry in controller._colorized_mask_cache
     assert base_entry not in controller._colorized_mask_cache
     expected_size = controller._target_scaled_size(layer.mask_image.size(), scale_key)

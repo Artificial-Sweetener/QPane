@@ -17,7 +17,7 @@ config = {
         "weights": {  # Relative weights used to split the active cache budget.
             "tiles": 22.0,  # Weight for tile cache share.
             "pyramids": 18.0,  # Weight for pyramid cache share.
-            "masks": 50.0,  # Weight for mask overlay cache share.
+            "masks": 50.0,  # Weight for mask render cache share.
             "predictors": 10.0,  # Weight for SAM predictor cache share.
         },
         "prefetch": {  # Neighbor prefetch depths for background warmup.

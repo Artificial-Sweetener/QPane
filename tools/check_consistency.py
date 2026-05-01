@@ -133,6 +133,19 @@ class DemoSource:
     inject_qpane_instance: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class MarkdownBlock:
+    """Represent a parsed markdown block for documentation checks."""
+
+    kind: str
+    text: str
+    path: Path
+    line: int
+    heading_path: tuple[str, ...]
+    rejected_section: bool = False
+    rejected_list_run: bool = False
+
+
 # --- Scanner Logic (formerly api_scanner.py) ---
 
 
@@ -931,6 +944,277 @@ def extract_symbols_from_text(text: str, pattern: Pattern[str]) -> list[str]:
     return pattern.findall(text)
 
 
+REFERENCE_HEADING_RE = re.compile(
+    r"\b(?:API Reference|Full API|Field Reference|Fields)\b",
+    re.IGNORECASE,
+)
+SYMBOL_LIST_RE = re.compile(
+    r"^\s*(?:[-*+]\s*)?(?:`)?[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)?(?:`)?"
+    r"\s*(?:[:\-–—]?\s*)?$"
+)
+CODE_SPAN_RE = re.compile(r"`[^`]*`")
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_'-]*")
+
+
+def parse_markdown_blocks(path: Path) -> list[MarkdownBlock]:
+    """Parse markdown into coarse blocks for prose-floor documentation checks."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    blocks: list[MarkdownBlock] = []
+    heading_stack: list[tuple[int, str, bool]] = []
+    paragraph: list[str] = []
+    paragraph_line = 0
+    in_code = False
+    code_lines: list[str] = []
+    code_line = 0
+
+    def active_heading_path() -> tuple[str, ...]:
+        return tuple(heading for _level, heading, _rejected in heading_stack)
+
+    def active_rejected() -> bool:
+        return any(rejected for _level, _heading, rejected in heading_stack)
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph, paragraph_line
+        if not paragraph:
+            return
+        text = " ".join(part.strip() for part in paragraph).strip()
+        if text:
+            blocks.append(
+                MarkdownBlock(
+                    kind="paragraph",
+                    text=text,
+                    path=path,
+                    line=paragraph_line,
+                    heading_path=active_heading_path(),
+                    rejected_section=active_rejected(),
+                )
+            )
+        paragraph = []
+        paragraph_line = 0
+
+    def flush_code() -> None:
+        nonlocal code_lines, code_line
+        if not code_lines:
+            return
+        blocks.append(
+            MarkdownBlock(
+                kind="code",
+                text="\n".join(code_lines),
+                path=path,
+                line=code_line,
+                heading_path=active_heading_path(),
+                rejected_section=active_rejected(),
+            )
+        )
+        code_lines = []
+        code_line = 0
+
+    for lineno, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                flush_code()
+                in_code = False
+            else:
+                flush_paragraph()
+                in_code = True
+                code_line = lineno
+                code_lines = []
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            flush_paragraph()
+            level = len(heading.group(1))
+            title = heading.group(2).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append(
+                (level, title, bool(REFERENCE_HEADING_RE.search(title)))
+            )
+            blocks.append(
+                MarkdownBlock(
+                    kind="heading",
+                    text=title,
+                    path=path,
+                    line=lineno,
+                    heading_path=active_heading_path(),
+                    rejected_section=active_rejected(),
+                )
+            )
+            continue
+        if not stripped:
+            flush_paragraph()
+            continue
+        list_item = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$", line)
+        if list_item:
+            flush_paragraph()
+            blocks.append(
+                MarkdownBlock(
+                    kind="list",
+                    text=list_item.group(1).strip(),
+                    path=path,
+                    line=lineno,
+                    heading_path=active_heading_path(),
+                    rejected_section=active_rejected(),
+                )
+            )
+            continue
+        if not paragraph:
+            paragraph_line = lineno
+        paragraph.append(line)
+    flush_paragraph()
+    if in_code:
+        flush_code()
+    return mark_rejected_symbol_list_runs(blocks)
+
+
+def mark_rejected_symbol_list_runs(blocks: list[MarkdownBlock]) -> list[MarkdownBlock]:
+    """Mark long consecutive bare-symbol list runs as rejected coverage."""
+    result = list(blocks)
+    run: list[int] = []
+
+    def flush_run() -> None:
+        nonlocal run, result
+        if len(run) > 12:
+            for idx in run:
+                block = result[idx]
+                result[idx] = dataclasses.replace(block, rejected_list_run=True)
+        run = []
+
+    for idx, block in enumerate(result):
+        if block.kind == "list" and SYMBOL_LIST_RE.match(block.text):
+            run.append(idx)
+        else:
+            flush_run()
+    flush_run()
+    return result
+
+
+def explanatory_word_count(text: str, symbol_pattern: Pattern[str]) -> int:
+    """Return a conservative count of non-symbol words in markdown text."""
+    cleaned = CODE_SPAN_RE.sub(" ", text)
+    cleaned = symbol_pattern.sub(" ", cleaned)
+    tokens = TOKEN_RE.findall(cleaned)
+    ignored = {"http", "https", "md", "py", "true", "false", "none"}
+    return sum(1 for token in tokens if token.lower() not in ignored)
+
+
+def block_is_bare_symbol_mention(
+    block: MarkdownBlock, symbol_pattern: Pattern[str]
+) -> bool:
+    """Return True when a markdown block is mostly public symbols and syntax."""
+    symbol_tokens = extract_symbols_from_text(block.text, symbol_pattern)
+    if not symbol_tokens:
+        return False
+    word_count = explanatory_word_count(block.text, symbol_pattern)
+    return word_count < len(symbol_tokens)
+
+
+def block_has_explanatory_prose(
+    block: MarkdownBlock,
+    symbol_pattern: Pattern[str],
+    *,
+    minimum_words: int = 8,
+) -> bool:
+    """Return True when a block has enough non-symbol words to count as prose."""
+    if block.rejected_section or block.rejected_list_run:
+        return False
+    if block.kind not in {"paragraph", "list"}:
+        return False
+    if SYMBOL_LIST_RE.match(block.text):
+        return False
+    if block_is_bare_symbol_mention(block, symbol_pattern):
+        return False
+    return explanatory_word_count(block.text, symbol_pattern) >= minimum_words
+
+
+def collect_valid_guide_symbols(
+    paths: Iterable[Path],
+    symbol_pattern: Pattern[str],
+) -> tuple[set[str], list[str]]:
+    """Return guide symbols that appear with explanatory context and quality errors."""
+    symbols: set[str] = set()
+    errors: list[str] = []
+    for path in paths:
+        blocks = parse_markdown_blocks(path)
+        for block in blocks:
+            if block.kind == "heading" and block.rejected_section:
+                errors.append(
+                    f"[Guides] Reference-style heading in {path.name}:{block.line}: {block.text}"
+                )
+            if block.kind == "list" and block.rejected_list_run:
+                errors.append(
+                    f"[Guides] Symbol dump in {path.name}:{block.line}; rewrite as workflow prose"
+                )
+        for idx, block in enumerate(blocks):
+            block_symbols = set(extract_symbols_from_text(block.text, symbol_pattern))
+            if not block_symbols:
+                continue
+            if block_has_explanatory_prose(block, symbol_pattern):
+                symbols.update(block_symbols)
+                continue
+            if block.kind == "code" and not block.rejected_section:
+                nearby = (
+                    blocks[max(0, idx - 2) : idx]
+                    + blocks[idx + 1 : min(len(blocks), idx + 3)]
+                )
+                for name in block_symbols:
+                    if any(
+                        name
+                        in extract_symbols_from_text(candidate.text, symbol_pattern)
+                        and block_has_explanatory_prose(candidate, symbol_pattern)
+                        for candidate in nearby
+                    ):
+                        symbols.add(name)
+                continue
+            if block.kind in {"paragraph", "list"} and (
+                block.rejected_section
+                or block.rejected_list_run
+                or SYMBOL_LIST_RE.match(block.text)
+                or block_is_bare_symbol_mention(block, symbol_pattern)
+            ):
+                joined = ", ".join(sorted(block_symbols))
+                errors.append(
+                    f"[Guides] Bare symbol mention in {path.name}:{block.line}: {joined}"
+                )
+    return symbols, errors
+
+
+def collect_api_reference_symbols(
+    path: Path,
+    symbol_pattern: Pattern[str],
+) -> tuple[set[str], list[str]]:
+    """Return API reference symbols that have a short same-block explainer."""
+    if not path.exists():
+        return set(), [f"API Reference file missing: {API_REFERENCE_NAME}"]
+    symbols: set[str] = set()
+    errors: list[str] = []
+    for block in parse_markdown_blocks(path):
+        block_symbols = set(extract_symbols_from_text(block.text, symbol_pattern))
+        if not block_symbols:
+            continue
+        if "](" in block.text:
+            continue
+        if block.kind == "heading":
+            symbols.update(block_symbols)
+            continue
+        if block.kind not in {"paragraph", "list"}:
+            continue
+        if explanatory_word_count(block.text, symbol_pattern) >= 2:
+            symbols.update(block_symbols)
+        else:
+            joined = ", ".join(sorted(block_symbols))
+            errors.append(
+                f"[API Reference] Missing short explainer in {path.name}:{block.line}: {joined}"
+            )
+    return symbols, errors
+
+
 def collect_doc_symbols(
     paths: Iterable[Path], pattern: Pattern[str]
 ) -> tuple[set[str], dict[str, int], dict[str, dict[str, int]]]:
@@ -1078,7 +1362,10 @@ def check_doc_consistency(
     guide_paths = [p for p in DOCS_DIR.glob("*.md") if p.name != API_REFERENCE_NAME]
     # 1. Check API Reference
     if api_ref_path.exists():
-        ref_symbols, _, _ = collect_doc_symbols([api_ref_path], symbol_pattern)
+        ref_symbols, ref_quality_errors = collect_api_reference_symbols(
+            api_ref_path, symbol_pattern
+        )
+        errors.extend(ref_quality_errors)
         missing_ref = expected - ref_symbols
         for name in sorted(missing_ref):
             errors.append(f"[API Reference] Missing: {name}")
@@ -1088,11 +1375,15 @@ def check_doc_consistency(
     else:
         errors.append(f"API Reference file missing: {API_REFERENCE_NAME}")
     # 2. Check Guides
-    guide_symbols, _, _ = collect_doc_symbols(guide_paths, symbol_pattern)
+    guide_symbols, guide_quality_errors = collect_valid_guide_symbols(
+        guide_paths, symbol_pattern
+    )
+    errors.extend(guide_quality_errors)
     missing_guide = expected - guide_symbols
     for name in sorted(missing_guide):
         errors.append(f"[Guides] Missing: {name}")
-    extra_guide = guide_symbols - expected
+    all_guide_symbols, _, _ = collect_doc_symbols(guide_paths, symbol_pattern)
+    extra_guide = all_guide_symbols - expected
     for name in sorted(extra_guide):
         errors.append(f"[Guides] Ghost (not in API): {name}")
     return errors

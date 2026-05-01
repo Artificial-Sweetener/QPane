@@ -337,10 +337,9 @@ class Catalog:
         """
         self._controller.displayCurrentCatalogImage(fit_view=fit_view)
 
-    def currentImage(self) -> QImage:
-        """Return the currently selected image or a null QImage when absent."""
-        image = self._catalog.getCurrentImage()
-        return image if image is not None else QImage()
+    def currentImage(self) -> QImage | None:
+        """Return the currently selected image, or None when absent."""
+        return self._catalog.getCurrentImage()
 
     def currentImagePath(self) -> Path | None:
         """Return the filesystem path for the current image when known."""

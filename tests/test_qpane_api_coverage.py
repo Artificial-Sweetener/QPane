@@ -63,8 +63,9 @@ def test_image_properties_delegate(qapp):
         qpane.setImagesByID(
             QPane.imageMapFromLists([image1, image2], [None, None], [id1, id2]), id1
         )
-        assert qpane.currentImage is not None
-        assert qpane.currentImage.size() == image1.size()
+        current_image = qpane.currentImage
+        assert current_image is not None
+        assert current_image.size() == image1.size()
         assert len(qpane.allImages) == 2
         assert len(qpane.allImagePaths) == 2
     finally:
@@ -297,6 +298,7 @@ def test_image_management_extended(qapp):
         assert qpane.hasImages() is False
         assert qpane.imageIDs() == []
         assert qpane.currentImageID() is None
+        assert qpane.currentImage is None
         image1 = _solid_image()
         id1 = uuid.uuid4()
         path1 = Path("dummy.png")
@@ -397,6 +399,8 @@ def test_signals_existence(qapp):
         qpane.linkGroupsChanged.connect(slot)
         qpane.diagnosticsOverlayToggled.connect(slot)
         qpane.diagnosticsDomainToggled.connect(slot)
+        qpane.comparisonChanged.connect(slot)
+        qpane.sceneChanged.connect(slot)
         qpane.samCheckpointStatusChanged.connect(slot)
         qpane.samCheckpointProgress.connect(slot)
     finally:
@@ -430,10 +434,45 @@ def test_overlays_api(qapp):
             pass
 
         qpane.registerOverlay("test_overlay", draw_fn)
-        # No direct getter for overlays in QPane API, but we can check interaction
-        assert "test_overlay" in qpane.interaction.content_overlays
+        assert "test_overlay" in qpane.contentOverlays()
         qpane.unregisterOverlay("test_overlay")
-        assert "test_overlay" not in qpane.interaction.content_overlays
+        assert "test_overlay" not in qpane.contentOverlays()
+    finally:
+        _cleanup_qpane(qpane, qapp)
+
+
+def test_overlay_registry_snapshots_are_read_only(qapp):
+    """Overlay registry accessors should not expose live mutable registries."""
+    qpane = QPane(features=())
+    try:
+
+        def draw_fn(painter, state):
+            pass
+
+        qpane.registerOverlay("test_overlay", draw_fn)
+        qpane.registerSceneOverlay("test_scene_overlay", draw_fn)
+
+        content_snapshot = qpane.contentOverlays()
+        scene_snapshot = qpane.sceneOverlays()
+
+        assert "test_overlay" in content_snapshot
+        assert "test_scene_overlay" in scene_snapshot
+        with pytest.raises(TypeError):
+            content_snapshot["late_overlay"] = draw_fn
+        with pytest.raises(TypeError):
+            scene_snapshot["late_scene_overlay"] = draw_fn
+        with pytest.raises(AttributeError):
+            content_snapshot.clear()
+        with pytest.raises(AttributeError):
+            scene_snapshot.clear()
+
+        qpane.unregisterOverlay("test_overlay")
+        qpane.unregisterSceneOverlay("test_scene_overlay")
+
+        assert "test_overlay" in content_snapshot
+        assert "test_scene_overlay" in scene_snapshot
+        assert "test_overlay" not in qpane.contentOverlays()
+        assert "test_scene_overlay" not in qpane.sceneOverlays()
     finally:
         _cleanup_qpane(qpane, qapp)
 

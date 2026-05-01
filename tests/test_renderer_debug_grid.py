@@ -16,9 +16,11 @@
 
 """Tests for renderer debug grid behaviour."""
 
-from PySide6.QtCore import QPointF, QRect, QRectF
-from PySide6.QtGui import QImage, QTransform
-from qpane.rendering import Renderer, RenderState, RenderStrategy
+from PySide6.QtCore import QPointF, QRect
+from PySide6.QtGui import QImage
+from qpane.rendering import Renderer
+from qpane.scene.render_plan import RenderStrategy
+from tests.helpers.render_plan import make_render_plan
 
 
 class _StubQPane:
@@ -48,26 +50,18 @@ class _PainterStub:
         self.rects.append(rect)
 
 
-def _make_render_state(draw_grid: bool) -> RenderState:
-    """Build a minimal render state for exercising the grid overlay."""
+def _make_render_plan(draw_grid: bool):
+    """Build a minimal render plan for exercising the grid overlay."""
     image = QImage(256, 256, QImage.Format_RGB32)
     image.fill(0)
-    return RenderState(
+    return make_render_plan(
+        QRect(0, 0, 256, 256),
         source_image=image,
-        pyramid_scale=1.0,
-        transform=QTransform(),
-        zoom=1.0,
         strategy=RenderStrategy.TILE,
-        render_hint_enabled=False,
         debug_draw_tile_grid=draw_grid,
-        tiles_to_draw=[],
         tile_size=64,
-        tile_overlap=0,
         max_tile_cols=4,
         max_tile_rows=4,
-        qpane_rect=QRect(0, 0, 256, 256),
-        current_pan=QPointF(0, 0),
-        physical_viewport_rect=QRectF(0, 0, 256, 256),
         visible_tile_range=(0, 3, 0, 3),
     )
 
@@ -76,8 +70,8 @@ def test_debug_grid_skips_when_flag_disabled():
     """Renderer should skip drawing when the state flag is false."""
     renderer = Renderer(_StubQPane())
     painter = _PainterStub()
-    state = _make_render_state(draw_grid=False)
-    renderer._draw_tile_debug_overlay(painter, state)
+    plan = _make_render_plan(draw_grid=False)
+    renderer._draw_tile_debug_overlay(painter, plan, plan.base_raster_item)
     assert painter.rects == []
 
 
@@ -85,6 +79,6 @@ def test_debug_grid_draws_when_flag_enabled():
     """Renderer should draw tile outlines when the state flag is true."""
     renderer = Renderer(_StubQPane())
     painter = _PainterStub()
-    state = _make_render_state(draw_grid=True)
-    renderer._draw_tile_debug_overlay(painter, state)
+    plan = _make_render_plan(draw_grid=True)
+    renderer._draw_tile_debug_overlay(painter, plan, plan.base_raster_item)
     assert painter.rects, "Expected at least one debug rectangle to be drawn"

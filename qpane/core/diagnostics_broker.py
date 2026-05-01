@@ -461,13 +461,11 @@ class Diagnostics(QObject):
                 pyramid_accessor = getattr(catalog, "pyramidManager", None)
                 if callable(pyramid_accessor):
                     pyramid_manager = pyramid_accessor()
-            base_image = getattr(self._qpane, "original_image", None)
             return build_core_diagnostics(
                 renderer=renderer,
                 viewport=viewport,
                 tile_manager=tile_manager,
                 pyramid_manager=pyramid_manager,
-                base_image=base_image,
                 cache_snapshot=cache_snapshot,
             )
 

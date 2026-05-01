@@ -494,6 +494,26 @@ class PlaceholderSettings:
             scale_factor=float(self.scale_factor),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Expose the placeholder settings as JSON-serializable primitives."""
+        return {
+            "source": self.source,
+            "panzoom_enabled": bool(self.panzoom_enabled),
+            "drag_out_enabled": bool(self.drag_out_enabled),
+            "zoom_mode": self.zoom_mode,
+            "locked_zoom": self.locked_zoom,
+            "locked_size": tuple(self.locked_size) if self.locked_size else None,
+            "scale_mode": self.scale_mode,
+            "display_size": tuple(self.display_size) if self.display_size else None,
+            "min_display_size": (
+                tuple(self.min_display_size) if self.min_display_size else None
+            ),
+            "max_display_size": (
+                tuple(self.max_display_size) if self.max_display_size else None
+            ),
+            "scale_factor": float(self.scale_factor),
+        }
+
     def apply_mapping(self, mapping: Mapping[str, Any]) -> None:
         """Merge supported keys from ``mapping`` into this configuration."""
         allowed = {
@@ -683,10 +703,12 @@ class Config:
         return clone
 
     def as_dict(self) -> dict[str, Any]:
-        """Expose the configuration as primitives including cache settings."""
+        """Expose the configuration as JSON-serializable primitives."""
         data = {key: self._copy_value(getattr(self, key)) for key in self.__slots__}
         cache_settings = getattr(self, "cache", CacheSettings())
         data["cache"] = cache_settings.to_dict()
+        placeholder_settings = getattr(self, "placeholder", PlaceholderSettings())
+        data["placeholder"] = placeholder_settings.to_dict()
         return data
 
     # Internal helpers ---------------------------------------------------
