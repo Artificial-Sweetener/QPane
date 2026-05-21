@@ -209,7 +209,7 @@ When you run `git commit`, our hooks run a battery of checks. If they fail, your
 *   **Auto-Formatting**: `ruff` and `black` will automatically format your code.
 *   **Encoding Check**: Ensures all files are valid UTF-8.
 *   **Docstring Check**: Fails if *any* module, class, or function is missing a docstring.
-*   **License Header Check**: Automatically adds or updates the GPLv3 license header.
+*   **License Header Check**: Automatically adds or updates the GPLv3-or-later license header.
 *   **Tests**: Runs the full test suite.
 *   **API Order Check**: Fails if public methods (from `.pyi`) are below the `# Internal Implementation` banner in `qpane.py`, or if internal methods are above it.
 *   **Consistency Check**: Fails if the "Trinity" is out of sync.

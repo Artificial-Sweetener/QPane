@@ -67,7 +67,7 @@ python tools/add_license_headers.py
 
 **Actions:**
 - Scans all git-tracked `.py` and `.pyi` files.
-- Adds the standard GPL license header if it is missing.
+- Adds the standard GPLv3-or-later license header if it is missing.
 - Updates the header if an older version is detected.
 
 **Output:**

@@ -3,9 +3,9 @@
   <img src="assets/logos/logo-white.png#gh-dark-mode-only" alt="QPane" width="320">
 </p>
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE) [![semantic-release](https://img.shields.io/badge/semantic--release-angular-e10079?logo=semantic-release)](https://github.com/semantic-release/semantic-release) [![PyPI](https://img.shields.io/pypi/v/qpane.svg)](https://pypi.org/project/qpane/) [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/) [![PySide6](https://img.shields.io/badge/PySide6-6.7.3%2B-41CD52?logo=qt&logoColor=white)](https://pyside.org) [![OpenCV optional](https://img.shields.io/badge/OpenCV-optional%204.9%2B-5C3EE8?logo=opencv&logoColor=white)](https://opencv.org/) [![PyTorch optional](https://img.shields.io/badge/PyTorch-optional%202.1%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE) [![semantic-release](https://img.shields.io/badge/semantic--release-angular-e10079?logo=semantic-release)](https://github.com/semantic-release/semantic-release) [![PyPI](https://img.shields.io/pypi/v/qpane.svg)](https://pypi.org/project/qpane/) [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/) [![PySide6](https://img.shields.io/badge/PySide6-6.7.3%2B-41CD52?logo=qt&logoColor=white)](https://pyside.org) [![OpenCV optional](https://img.shields.io/badge/OpenCV-optional%204.9%2B-5C3EE8?logo=opencv&logoColor=white)](https://opencv.org/) [![PyTorch optional](https://img.shields.io/badge/PyTorch-optional%202.1%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 
-**QPane** is a high-performance, **open-source (GPLv3)** image viewer, raster canvas, and scene composition widget for PySide6.
+**QPane** is a high-performance, **open-source (GPLv3 or later)** image viewer, raster canvas, and scene composition widget for PySide6.
 
 It bridges the gap between a raw `QGraphicsView` and a full-blown image editor, providing a drop-in widget for **interactive workflows**—specifically those involving high-resolution image inspection, dataset curation, scene review, comparison, and precise masking.
 
@@ -13,7 +13,7 @@ Whether you are building a simple photo viewer or a mission-critical imaging sys
 
 ## Highlights
 *   **Drop-in PySide6 Widget:** A production-ready image viewer you can add to any layout in a few lines of code.
-*   **True FOSS:** Distributed under GPLv3 to ensure it remains free for everyone. No pro versions, no hidden costs.
+*   **True FOSS:** Distributed under GPLv3 or later to ensure it remains free for everyone. No pro versions, no hidden costs.
 *   **CPU-First Performance:** Renders massive images smoothly using system RAM, ensuring responsiveness on any hardware—from laptops to workstations.
 *   **Fluid Pan & Zoom Navigation:** Silky smooth zooming, panning, and tiling out of the box.
 *   **Scene Compositions:** Arrange catalog images into persistent review grids, contact sheets, two-up views, and layered scenes without flattening pixels.
@@ -183,7 +183,7 @@ widget.maskSaved.connect(lambda mid, path: print(f"Saved mask to {path}"))
 
 ## License & Philosophy
 
-QPane is **Free and Open Source Software (FOSS)**, distributed under the **GNU General Public License v3.0**.
+QPane is **Free and Open Source Software (FOSS)**, distributed under the **GNU General Public License v3.0 or later**.
 
 I believe that robust UI infrastructure should be a public good, not a proprietary product. QPane is designed to be the standard, high-performance viewer for the PySide6 ecosystem. The GPL ensures it remains free forever, and that any optimizations or fixes made to the core engine are shared back to benefit the next developer.
 
