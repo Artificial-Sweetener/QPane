@@ -1724,9 +1724,15 @@ class QPane(QWidget):
 
     def onViewChanged(self):
         """Slot connected to the viewport's viewChanged signal."""
-        self.markDirty()
-        self.update()
-        self.refreshCursor()
+        reused = self.view().handle_viewport_changed()
+        if reused:
+            cursor_refresh_needed = False
+        else:
+            self.markDirty()
+            self.update()
+            cursor_refresh_needed = True
+        if cursor_refresh_needed:
+            self.refreshCursor()
         self._emit_zoom_snapshot()
         self._emit_viewport_rect_if_changed()
 

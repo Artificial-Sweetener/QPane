@@ -65,7 +65,7 @@ class CompareDividerInteraction:
 
     def cursor(self) -> QCursor | None:
         """Return the divider cursor when hover or drag state owns the pointer."""
-        if not self._interaction_active() or not (self._hovered or self._dragging):
+        if not self.owns_cursor():
             return None
         orientation = self._service.state().orientation
         shape = (
@@ -74,6 +74,10 @@ class CompareDividerInteraction:
             else Qt.CursorShape.SizeHorCursor
         )
         return QCursor(shape)
+
+    def owns_cursor(self) -> bool:
+        """Return whether divider state currently controls the cursor."""
+        return self._interaction_active() and (self._hovered or self._dragging)
 
     def geometry(self) -> ProjectedClipBoundary | None:
         """Return divider geometry for the active comparison state."""

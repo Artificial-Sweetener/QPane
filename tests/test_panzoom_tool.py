@@ -55,12 +55,16 @@ class _WheelEventStub:
     def __init__(self, point: QPointF, delta_y: int):
         self._point = QPointF(point)
         self._delta_y = delta_y
+        self.accepted = False
 
     def position(self) -> QPointF:
         return QPointF(self._point)
 
     def angleDelta(self) -> QPoint:
         return QPoint(0, self._delta_y)
+
+    def accept(self) -> None:
+        self.accepted = True
 
 
 def _make_mouse_event(
@@ -135,6 +139,36 @@ def test_panzoom_emits_pan_when_dragging(qapp):
     move = _PositioningMouseEvent(QPointF(6, 9), buttons=Qt.MouseButton.LeftButton)
     tool.mouseMoveEvent(move)
     assert emissions == [QPointF(9.0, 16.0)]
+
+
+def test_panzoom_does_not_emit_cursor_update_for_steady_pan_move(qapp):
+    tool = PanZoomTool()
+    current_pan = QPointF(4.0, 8.0)
+    pan_emissions: list[QPointF] = []
+    cursor_emissions: list[None] = []
+    tool.signals.pan_requested.connect(lambda pan: pan_emissions.append(pan))
+    tool.signals.cursor_update_requested.connect(lambda: cursor_emissions.append(None))
+    tool.activate(
+        ToolDependencies(
+            is_pan_zoom_locked=lambda: False,
+            is_image_null=lambda: False,
+            is_drag_out_allowed=lambda: False,
+            can_pan=lambda: True,
+            get_pan=lambda: current_pan,
+            get_zoom=lambda: 2.0,
+        )
+    )
+    press = _PositioningMouseEvent(QPointF(1, 1))
+    tool.mousePressEvent(press)
+    assert len(cursor_emissions) == 1
+    cursor_emissions.clear()
+    move = _PositioningMouseEvent(QPointF(6, 9), buttons=Qt.MouseButton.LeftButton)
+    tool.mouseMoveEvent(move)
+    assert pan_emissions == [QPointF(9.0, 16.0)]
+    assert cursor_emissions == []
+    release = _PositioningMouseEvent(QPointF(6, 9))
+    tool.mouseReleaseEvent(release)
+    assert len(cursor_emissions) == 1
 
 
 def test_panzoom_scales_drag_delta_by_dpr(qapp):
@@ -309,6 +343,36 @@ def test_panzoom_wheel_emits_zoom(qapp):
     assert zooms[0][0] == pytest.approx(2.5)
     assert zooms[0][1] == QPoint(5, 5)
     assert zooms[1][0] == pytest.approx(2.0)
+
+
+def test_panzoom_wheel_uses_delta_magnitude(qapp):
+    tool = PanZoomTool()
+    zooms: List[float] = []
+    current_zoom = 2.0
+
+    def on_zoom(value: float, _anchor: QPoint) -> None:
+        nonlocal current_zoom
+        zooms.append(value)
+        current_zoom = value
+
+    tool.signals.zoom_requested.connect(on_zoom)
+    tool.activate(
+        ToolDependencies(
+            is_pan_zoom_locked=lambda: False,
+            is_image_null=lambda: False,
+            get_pan=lambda: QPointF(0, 0),
+            get_zoom=lambda: current_zoom,
+            get_native_zoom=lambda: 1.0,
+        )
+    )
+    grow_event = _WheelEventStub(QPointF(5, 5), 240)
+    tool.wheelEvent(grow_event)
+    shrink_event = _WheelEventStub(QPointF(5, 5), -240)
+    tool.wheelEvent(shrink_event)
+    assert zooms[0] == pytest.approx(2.0 * 1.25 * 1.25)
+    assert zooms[1] == pytest.approx(2.0)
+    assert grow_event.accepted is True
+    assert shrink_event.accepted is True
 
 
 def test_panzoom_wheel_snaps_to_native_zoom_on_crossing(qapp):

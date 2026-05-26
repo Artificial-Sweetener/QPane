@@ -148,6 +148,23 @@ def test_redraw_base_image_buffer_resets_buffer_pan_when_full_dirty():
     assert renderer._subpixel_pan_offset == QPointF(0.0, 0.0)
 
 
+def test_redraw_base_image_buffer_resets_buffer_pan_for_full_dirty_sentinel():
+    """Full-view sentinel redraws should reset the buffer's pan identity."""
+    qpane_rect = QRect(0, 0, 32, 32)
+    renderer = Renderer(types.SimpleNamespace())
+    renderer._base_image_buffer = QImage(
+        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
+    )
+    renderer._base_image_buffer.fill(Qt.transparent)
+    renderer._buffer_pan = QPointF(-64.0, 608.0)
+    renderer._subpixel_pan_offset = QPointF(-0.69, 0.69)
+    plan = _make_render_plan(qpane_rect)
+    dirty_region = QRegion(QRect(-100000, -100000, 200000, 200000))
+    renderer._redraw_base_image_buffer(dirty_region, plan)
+    assert renderer._buffer_pan == plan.current_pan
+    assert renderer._subpixel_pan_offset == QPointF(0.0, 0.0)
+
+
 def test_redraw_base_image_buffer_keeps_buffer_pan_when_partial_dirty():
     qpane_rect = QRect(0, 0, 32, 32)
     renderer = Renderer(types.SimpleNamespace())
@@ -184,6 +201,29 @@ def test_paint_skips_redraw_when_clean():
     assert len(calls) == 1
     renderer.paint(plan)
     assert len(calls) == 1
+
+
+def test_paint_updates_current_plan_when_redraw_is_clean():
+    """Clean paints should still refresh geometry used by overlays and hit tests."""
+    qpane_rect = QRect(0, 0, 32, 32)
+    renderer = Renderer(types.SimpleNamespace())
+    renderer._base_image_buffer = QImage(
+        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
+    )
+    renderer._base_image_buffer.fill(Qt.transparent)
+    previous_plan = _make_render_plan(qpane_rect)
+    current_plan = make_render_plan(
+        qpane_rect,
+        source_image=previous_plan.base_raster_item.source_image,
+        transform=QTransform(previous_plan.base_raster_item.transform),
+        strategy=previous_plan.base_raster_item.strategy,
+        current_pan=QPointF(17.0, -4.0),
+        physical_viewport_rect=QRectF(qpane_rect),
+    )
+    renderer._current_render_plan = previous_plan
+    renderer._dirty_region = QRegion()
+    renderer.paint(current_plan)
+    assert renderer.get_current_render_plan() is current_plan
 
 
 def test_paint_marks_buffer_on_first_use():

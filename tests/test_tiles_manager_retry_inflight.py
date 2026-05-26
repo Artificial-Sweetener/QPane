@@ -40,7 +40,7 @@ def test_tiles_inflight_tracked_via_retry_controller(qapp) -> None:
     # First request should submit exactly one task and record inflight
     assert manager.get_tile(ident, image) is None
     pending = list(executor.pending_tasks())
-    assert len(pending) == 1 and pending[0].handle.category == "tiles"
+    assert len(pending) == 1 and pending[0].handle.category == "tiles_visible"
     assert ident in manager._worker_state
     # Second request while inflight should not enqueue another task
     assert manager.get_tile(ident, image) is None

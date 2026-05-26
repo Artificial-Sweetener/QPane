@@ -87,6 +87,7 @@ class Renderer:
     def paint(self, plan: SceneRenderPlan):
         """Prepare offscreen buffers for the requested scene without drawing to the widget."""
         start_time = time.perf_counter()
+        self._current_render_plan = plan
         # Ensure buffers are allocated. The QPane is responsible for calling
         # _allocate_buffers on resize, but we need to handle the initial case.
         if self._base_image_buffer is None:
@@ -157,6 +158,8 @@ class Renderer:
         context = CoordinateContext(self.qpane)
         logical_delta = context.physical_to_logical(QPointF(dx, dy))
         base_image = self._base_image_buffer
+        previous_buffer_pan = QPointF(self._buffer_pan)
+        previous_subpixel_offset = QPointF(self._subpixel_pan_offset)
         if (
             self._scroll_temp is None
             or self._scroll_temp.size() != base_image.size()
@@ -192,8 +195,12 @@ class Renderer:
                     "QPane view must provide calculateRenderPlan for buffer repair"
                 )
             plan = plan_calculate(use_pan=self._buffer_pan)
-            if plan:
-                self._repair_base_buffer_strips(repair_rects, plan)
+            if plan and self._repair_base_buffer_strips(repair_rects, plan) is False:
+                self._scroll_temp.swap(self._base_image_buffer)
+                self._buffer_pan = previous_buffer_pan
+                self._subpixel_pan_offset = previous_subpixel_offset
+                self._scroll_misses += 1
+                return False
         self._scroll_hits += 1
         viewport = self.qpane.view().viewport
         self._subpixel_pan_offset = viewport.pan - self._buffer_pan
@@ -262,15 +269,15 @@ class Renderer:
 
     def _repair_base_buffer_strips(
         self, repair_rects: list[QRect], plan: SceneRenderPlan
-    ):
+    ) -> bool:
         """Repair scene strips after buffer scrolling."""
         if not plan.render_items:
-            return
+            return True
         if self._can_repair_base_strips_directly(plan):
             self._repair_base_raster_strips_directly(repair_rects, plan)
-            return
+            return True
         if self._repair_layered_strips(repair_rects, plan):
-            return
+            return True
         painter = QPainter(self._base_image_buffer)
         context = CoordinateContext(self.qpane)
         try:
@@ -288,10 +295,12 @@ class Renderer:
             self._draw_visible_scene_items(painter, plan)
         finally:
             painter.end()
+        return True
 
     def _can_repair_base_strips_directly(self, plan: SceneRenderPlan) -> bool:
         """Return True when scroll repair can use the base-image fast path."""
-        return self._base_only_raster_item(plan) is not None
+        base_item = self._base_only_raster_item(plan)
+        return base_item is not None and base_item.strategy == RenderStrategy.DIRECT
 
     def _repair_base_raster_strips_directly(
         self, repair_rects: list[QRect], plan: SceneRenderPlan
@@ -433,7 +442,7 @@ class Renderer:
         *,
         draw_source_for_tiled: bool = False,
     ) -> bool:
-        """Draw only source pixels that map into the repaired strip rectangles."""
+        """Draw raster pixels that map into the repaired strip rectangles."""
         inverse, invertible = item.transform.inverted()
         if not invertible:
             return False
@@ -450,6 +459,7 @@ class Renderer:
             if source_rect.isEmpty():
                 continue
             if item.strategy == RenderStrategy.TILE and not draw_source_for_tiled:
+                painter.drawImage(source_rect, item.source_image, source_rect)
                 self._draw_intersecting_tile_strips(painter, item, source_rect)
             else:
                 painter.drawImage(source_rect, item.source_image, source_rect)
@@ -515,7 +525,8 @@ class Renderer:
             return
         qpane_rect = plan.qpane_rect
         qpane_region = QRegion(qpane_rect)
-        if dirty_region.intersected(qpane_region) == qpane_region:
+        full_viewport_dirty = dirty_region.intersected(qpane_region) == qpane_region
+        if full_viewport_dirty:
             self._full_redraws += 1
         else:
             self._partial_redraws += 1
@@ -575,7 +586,7 @@ class Renderer:
                 self._draw_visible_scene_items(buffer_painter, plan)
         finally:
             buffer_painter.end()
-            if plan.qpane_rect in dirty_region:
+            if full_viewport_dirty:
                 self._buffer_pan = QPointF(plan.current_pan)
                 self._subpixel_pan_offset = QPointF(0, 0)
 

@@ -159,9 +159,11 @@ All keys are optional:
 concurrency = {
     "max_workers": 4,  # Bump threads for massive datasets
     "category_priorities": {
-        "tiles": 30,   # Load visible tiles first
-        "io": 10,      # Then load files
-        "sam": 5,      # Run AI last
+        "tiles_visible": 40,   # Load visible tiles first
+        "pyramid": 30,         # Then build image pyramids
+        "tiles_prefetch": 20,  # Warm nearby tiles after visible work
+        "io": 10,              # Then load files
+        "sam": 5,              # Run AI last
     },
 }
 ```

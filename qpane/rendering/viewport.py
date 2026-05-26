@@ -26,6 +26,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPointF,
+    Qt,
     QSize,
     QSizeF,
     QTimer,
@@ -84,6 +85,7 @@ class Viewport(QObject):
         self.pan = QPointF(0, 0)
         self._pan_zoom_locked = False
         self._zoom_anim_timer = QTimer(self)
+        self._zoom_anim_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._zoom_anim_timer.timeout.connect(self._tick_zoom_animation)
         self._zoom_anim_elapsed = QElapsedTimer()
         self._zoom_anim_start_zoom = 1.0
@@ -390,8 +392,10 @@ class Viewport(QObject):
                 )
             return
         if self._should_interpolate_zoom(old_zoom, new_zoom):
-            duration_ms = self._pick_zoom_duration_ms(request_delta_ms)
             min_frame_ms = self._get_zoom_target_frame_ms()
+            duration_ms = self._pick_zoom_duration_ms(request_delta_ms)
+            if self._zoom_anim_pending:
+                duration_ms = max(duration_ms, min_frame_ms)
             if self._should_start_zoom_animation(duration_ms, min_frame_ms):
                 self._start_zoom_animation(
                     new_zoom,

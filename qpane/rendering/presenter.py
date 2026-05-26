@@ -37,6 +37,11 @@ from PySide6.QtWidgets import QWidget
 
 
 from .coordinates import CoordinateContext, PanelHitTest
+from .compiled_scene import (
+    CompiledRenderLayer,
+    CompiledRenderScene,
+    hit_test_items_for_scene,
+)
 
 from .render import Renderer
 
@@ -70,7 +75,6 @@ from ..scene.render_plan import (
     RasterLayerRenderItem,
     RenderStrategy,
     SceneContentSnapshot,
-    SceneHitTestItem,
     SceneLayerHitTestResult,
     SceneRenderPlan,
     SceneRenderItem,
@@ -105,34 +109,29 @@ class _StaticSceneProvider:
 
 
 @dataclass(frozen=True, slots=True)
-class _BaseRasterSnapshot:
-    """Behavior-preserving raster planning data shared by old and new snapshots."""
+class _FrameGeometry:
+    """Viewport-dependent geometry used while planning one rendered frame."""
 
-    base_image: QImage
-    source_image: QImage
-    scene: SceneDescriptor
-    image_id: uuid.UUID | None
-    source_path: Path | None
-    source_revision: int
-    asset_key: SceneLayerAssetKey
-    pyramid_asset_key: SceneLayerAssetKey
     content_snapshot: SceneContentSnapshot
-    pyramid_scale: float
-    transform: QTransform
     zoom: float
-    strategy: RenderStrategy
-    render_hint_enabled: bool
-    debug_draw_tile_grid: bool
-    tiles_to_draw: tuple[TileRenderData, ...]
-    tile_size: int
-    tile_overlap: int
-    max_tile_cols: int
-    max_tile_rows: int
-    qpane_rect: QRect
     current_pan: QPointF
+    qpane_rect: QRect
     physical_viewport_rect: QRectF
     visible_scene_rect: QRectF
-    visible_tile_range: tuple[int, int, int, int] | None
+    debug_draw_tile_grid: bool
+    tile_size: int
+    tile_overlap: int
+
+    def __post_init__(self) -> None:
+        """Detach mutable Qt geometry values from caller-owned frame inputs."""
+        object.__setattr__(self, "current_pan", QPointF(self.current_pan))
+        object.__setattr__(self, "qpane_rect", QRect(self.qpane_rect))
+        object.__setattr__(
+            self,
+            "physical_viewport_rect",
+            QRectF(self.physical_viewport_rect),
+        )
+        object.__setattr__(self, "visible_scene_rect", QRectF(self.visible_scene_rect))
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +140,17 @@ class _RasterPlanningResult:
 
     item: RasterLayerRenderItem | None
     visible_tile_keys: frozenset[SceneLayerTileKey]
+
+
+@dataclass(frozen=True, slots=True)
+class _TilePlan:
+    """Tile payloads and worker-cancellation keys for one raster layer."""
+
+    tiles_to_draw: tuple[TileRenderData, ...]
+    visible_keys: frozenset[SceneLayerTileKey]
+    max_tile_cols: int
+    max_tile_rows: int
+    visible_tile_range: tuple[int, int, int, int] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,11 +218,9 @@ class RenderingPresenter:
         self._last_view_size = QSize()
         self._last_device_pixel_ratio = float(qpane.devicePixelRatioF())
         self._placeholder_content_provider: Callable[[], object | None] | None = None
-        self._cached_content_key: tuple[object, ...] | None = None
-        self._cached_active_content: _ActiveSceneContent | None = None
-        self._cached_content_snapshot: SceneContentSnapshot | None = None
-        self._cached_hit_test_key: tuple[object, ...] | None = None
-        self._cached_hit_test_items: tuple[SceneHitTestItem, ...] = ()
+        self._cached_compiled_scene_key: tuple[object, ...] | None = None
+        self._cached_compiled_scene: CompiledRenderScene | None = None
+        self._last_scroll_reuse_signature: tuple[object, ...] | None = None
 
     def set_placeholder_content_provider(
         self, provider: Callable[[], object | None]
@@ -227,33 +235,28 @@ class RenderingPresenter:
         is_blank: bool = False,
     ) -> SceneRenderPlan | None:
         """Build the active scene render plan for the current viewport."""
-        snapshot = self._calculate_base_raster_snapshot(
-            use_pan=use_pan,
-            is_blank=is_blank,
-        )
-        if snapshot is None:
+        if is_blank:
             return None
-        scene = snapshot.scene
-        raster_items = self._build_raster_render_items(scene, snapshot)
+        compiled = self._compiled_render_scene()
+        if compiled is None:
+            return None
+        frame = self._frame_geometry_for(compiled, use_pan=use_pan)
+        raster_items = self._build_frame_raster_items(compiled, frame)
         if not raster_items:
             return None
         base_item = self._base_raster_item_from_items(raster_items)
-        mask_items = self._build_mask_render_items(
-            scene,
-            snapshot,
-            base_item,
-        )
+        mask_items = self._build_frame_mask_items(compiled, base_item)
         return SceneRenderPlan(
-            scene_id=scene.scene_id,
-            scene_bounds=scene.bounds,
-            content_bounds=scene.bounds,
-            content_snapshot=snapshot.content_snapshot,
-            zoom=snapshot.zoom,
-            current_pan=snapshot.current_pan,
-            qpane_rect=snapshot.qpane_rect,
-            physical_viewport_rect=snapshot.physical_viewport_rect,
+            scene_id=compiled.scene.scene_id,
+            scene_bounds=compiled.scene.bounds,
+            content_bounds=compiled.scene.bounds,
+            content_snapshot=compiled.content_snapshot,
+            zoom=frame.zoom,
+            current_pan=frame.current_pan,
+            qpane_rect=frame.qpane_rect,
+            physical_viewport_rect=frame.physical_viewport_rect,
             render_items=(*raster_items, *mask_items),
-            hit_test_items=self._cached_hit_test_items_for_scene(scene),
+            hit_test_items=compiled.hit_test_items,
         )
 
     def paint(
@@ -295,6 +298,11 @@ class RenderingPresenter:
         if render_plan:
             self._ensure_buffer_matches_widget()
             self.renderer.paint(render_plan)
+            self._last_scroll_reuse_signature = self._scroll_reuse_signature_for_plan(
+                render_plan
+            )
+        else:
+            self._last_scroll_reuse_signature = None
         painter = QPainter(self._qpane)
         transform_applied = False
         try:
@@ -434,6 +442,30 @@ class RenderingPresenter:
         """Forward dirty-region notifications to the renderer."""
         self.renderer.markDirty(dirty_rect)
 
+    def handle_viewport_changed(self) -> bool:
+        """Handle a viewport change with scroll reuse when only pan changed."""
+        compiled = self._compiled_render_scene()
+        if compiled is None:
+            self._last_scroll_reuse_signature = None
+            return False
+        previous_plan = self.renderer.get_current_render_plan()
+        if previous_plan is None:
+            return False
+        if not isclose(
+            previous_plan.zoom,
+            self.viewport.zoom,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            return False
+        current_signature = self._scroll_reuse_signature_for_plan(previous_plan)
+        if current_signature != self._last_scroll_reuse_signature:
+            return False
+        if self.renderer.get_base_buffer() is None:
+            return False
+        result = self.renderer.tryScrollBuffers(QPointF(self.viewport.pan))
+        return result
+
     def allocate_buffers(self) -> None:
         """Allocate the renderer buffers to match the current widget size."""
         self._refresh_backing_buffers()
@@ -512,27 +544,19 @@ class RenderingPresenter:
 
     def current_content_snapshot(self) -> SceneContentSnapshot | None:
         """Return geometry for the current rendered content when available."""
-        active_content = self._cached_active_scene_content()
-        if active_content is None:
-            return None
-        if self._cached_content_snapshot is None:
-            self._cached_content_snapshot = self._content_snapshot_for_active_content(
-                active_content
-            )
-        return self._cached_content_snapshot
+        compiled = self._compiled_render_scene()
+        return compiled.content_snapshot if compiled is not None else None
 
     def current_scene_descriptor(self) -> SceneDescriptor | None:
         """Return the active scene descriptor without building render items."""
-        active_content = self._cached_active_scene_content()
-        return active_content.scene if active_content is not None else None
+        compiled = self._compiled_render_scene()
+        return compiled.scene if compiled is not None else None
 
     def invalidate_content_cache(self) -> None:
         """Drop cached active scene/content geometry."""
-        self._cached_content_key = None
-        self._cached_active_content = None
-        self._cached_content_snapshot = None
-        self._cached_hit_test_key = None
-        self._cached_hit_test_items = ()
+        self._cached_compiled_scene_key = None
+        self._cached_compiled_scene = None
+        self._last_scroll_reuse_signature = None
 
     def has_renderable_content(self) -> bool:
         """Return True when the presenter can resolve content for rendering."""
@@ -556,6 +580,7 @@ class RenderingPresenter:
         physical_size = self._qpane_physical_size()
         dpr = self._qpane.devicePixelRatioF()
         self.renderer.allocate_buffers(physical_size, dpr)
+        self._last_scroll_reuse_signature = None
 
     def _ensure_buffer_matches_widget(self) -> None:
         """Reallocate renderer buffers when the widget size has changed."""
@@ -566,6 +591,62 @@ class RenderingPresenter:
         expected_size = self._qpane_physical_size()
         if base_buffer.size() != expected_size:
             self.allocate_buffers()
+
+    @staticmethod
+    def _scroll_reuse_signature_for_plan(
+        plan: SceneRenderPlan,
+    ) -> tuple[object, ...] | None:
+        """Return static render-plan inputs that must stay stable for scroll reuse."""
+        if not isinstance(plan, SceneRenderPlan):
+            return None
+        image_items = tuple(
+            (
+                item.descriptor.layer_id,
+                item.descriptor.kind,
+                item.descriptor.visible,
+                item.descriptor.opacity,
+                item.descriptor.blend_mode,
+                item.descriptor.placement,
+                item.descriptor.clip,
+                item.descriptor.source,
+                item.descriptor.source_revision,
+                item.asset_key,
+                item.pyramid_asset_key,
+                item.pyramid_scale,
+                item.strategy,
+                item.tile_size,
+                item.tile_overlap,
+                item.visible_tile_range,
+                item.debug_draw_tile_grid,
+            )
+            for item in plan.render_items
+            if isinstance(item, RasterLayerRenderItem)
+        )
+        mask_items = tuple(
+            (
+                item.descriptor.layer_id,
+                item.descriptor.visible,
+                item.descriptor.opacity,
+                item.descriptor.placement,
+                item.descriptor.clip,
+                item.descriptor.source,
+                item.descriptor.source_revision,
+                item.asset_key,
+                item.scale,
+            )
+            for item in plan.render_items
+            if isinstance(item, MaskLayerRenderItem)
+        )
+        return (
+            plan.scene_id,
+            plan.scene_bounds,
+            plan.content_bounds,
+            image_items,
+            mask_items,
+            plan.zoom,
+            plan.qpane_rect,
+            plan.physical_viewport_rect,
+        )
 
     # Internal helpers
 
@@ -668,40 +749,25 @@ class RenderingPresenter:
         """Resolve active raster layer geometry without paint payloads."""
         if is_blank:
             return ()
-        active_content = self._cached_active_scene_content()
-        if active_content is None:
+        compiled = self._compiled_render_scene()
+        if compiled is None:
             return ()
-        content_snapshot = self._content_snapshot_for_active_content(active_content)
-        current_pan = use_pan if use_pan is not None else self.viewport.pan
-        physical_viewport_rect = self.physical_viewport_rect()
-        visible_scene_rect = self._calculate_visible_scene_rect(
-            scene=active_content.scene,
-            zoom=self.viewport.zoom,
-            current_pan=current_pan,
-            physical_viewport_rect=physical_viewport_rect,
-        )
+        frame = self._frame_geometry_for(compiled, use_pan=use_pan)
         qpane_rect = QRectF(self._qpane.rect())
         geometries: list[RasterLayerGeometry] = []
-        base_layer = self._first_image_layer(active_content.scene)
-        for layer in active_content.scene.layers:
-            if not layer.visible or layer.kind != LayerKind.IMAGE:
-                continue
-            if base_layer is not None and layer.layer_id == base_layer.layer_id:
+        for layer in compiled.layers:
+            if layer.is_base_raster:
                 geometry = self._base_raster_geometry(
-                    active_content=active_content,
+                    compiled=compiled,
                     layer=layer,
-                    content_snapshot=content_snapshot,
-                    current_pan=current_pan,
-                    visible_scene_rect=visible_scene_rect,
+                    frame=frame,
                     qpane_rect=qpane_rect,
                 )
             else:
                 geometry = self._additional_raster_geometry(
-                    scene=active_content.scene,
+                    compiled=compiled,
                     layer=layer,
-                    content_snapshot=content_snapshot,
-                    current_pan=current_pan,
-                    visible_scene_rect=visible_scene_rect,
+                    frame=frame,
                     qpane_rect=qpane_rect,
                 )
             if geometry is not None:
@@ -711,55 +777,52 @@ class RenderingPresenter:
     def _base_raster_geometry(
         self,
         *,
-        active_content: _ActiveSceneContent,
-        layer: LayerDescriptor,
-        content_snapshot: SceneContentSnapshot,
-        current_pan: QPointF,
-        visible_scene_rect: QRectF,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
         qpane_rect: QRectF,
     ) -> RasterLayerGeometry | None:
         """Resolve geometry for the active base image layer."""
-        base_image = active_content.base_image
-        target_width = base_image.width() * self.viewport.zoom
-        source_image = (
-            self._catalog.getBestFitImageForAsset(
-                active_content.pyramid_asset_key,
-                target_width,
-            )
-            if active_content.image_id is not None
-            else base_image
+        target_width = layer.descriptor.placement.width * frame.zoom
+        source_image = self._best_fit_image_for_layer(
+            layer.descriptor,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            full_image=layer.full_image,
+            target_width=target_width,
         )
-        if source_image is None or source_image.isNull():
-            source_image = base_image
         pyramid_scale = (
-            source_image.width() / base_image.width() if base_image.width() > 0 else 1.0
+            source_image.width() / layer.full_image.width()
+            if layer.full_image.width() > 0
+            else 1.0
         )
-        transform = self.viewport.get_transform(
-            source_image.size(),
-            pyramid_scale,
-            pan_override=current_pan,
-            content_snapshot=content_snapshot,
+        transform = self._transform_for_compiled_layer(
+            compiled=compiled,
+            layer=layer,
+            source_image=source_image,
+            pyramid_scale=pyramid_scale,
+            frame=frame,
         )
         visibility = visible_source_rect_for_layer(
-            scene_bounds=active_content.scene.bounds,
-            layer_placement=layer.placement,
+            scene_bounds=compiled.scene.bounds,
+            layer_placement=layer.descriptor.placement,
             source_size=source_image.size(),
-            visible_scene_rect=visible_scene_rect,
-            clip=layer.clip,
+            visible_scene_rect=frame.visible_scene_rect,
+            clip=layer.descriptor.clip,
             viewport_rect=qpane_rect,
             item_transform=transform,
         )
         if visibility is None:
             return None
         return RasterLayerGeometry(
-            scene_id=active_content.scene.scene_id,
-            layer_id=layer.layer_id,
-            asset_key=active_content.asset_key,
-            pyramid_asset_key=active_content.pyramid_asset_key,
+            scene_id=compiled.scene.scene_id,
+            layer_id=layer.descriptor.layer_id,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
             pyramid_scale=pyramid_scale,
             transform=transform,
-            placement=layer.placement,
-            clip=layer.clip,
+            placement=layer.descriptor.placement,
+            clip=layer.descriptor.clip,
             source_size=source_image.size(),
             tile_size=self.tile_manager.tile_size,
             tile_overlap=self.tile_manager.tile_overlap,
@@ -769,58 +832,51 @@ class RenderingPresenter:
     def _additional_raster_geometry(
         self,
         *,
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        content_snapshot: SceneContentSnapshot,
-        current_pan: QPointF,
-        visible_scene_rect: QRectF,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
         qpane_rect: QRectF,
     ) -> RasterLayerGeometry | None:
         """Resolve geometry for a non-base image layer."""
-        full_image = self._source_image_for_layer(layer)
-        if full_image is None or full_image.isNull():
-            return None
-        asset_key = self._render_asset_key_for_image_layer(scene, layer)
-        pyramid_asset_key = self._pyramid_asset_key_for_image_layer(scene, layer)
-        if pyramid_asset_key is None:
-            return None
         source_image = self._best_fit_image_for_layer(
-            layer,
-            asset_key=asset_key,
-            pyramid_asset_key=pyramid_asset_key,
-            full_image=full_image,
-            target_width=layer.placement.width * self.viewport.zoom,
+            layer.descriptor,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            full_image=layer.full_image,
+            target_width=layer.descriptor.placement.width * frame.zoom,
         )
         pyramid_scale = (
-            source_image.width() / full_image.width() if full_image.width() > 0 else 1.0
+            source_image.width() / layer.full_image.width()
+            if layer.full_image.width() > 0
+            else 1.0
         )
-        transform = self._transform_for_placed_geometry(
-            scene=scene,
+        transform = self._transform_for_compiled_layer(
+            compiled=compiled,
             layer=layer,
-            source_size=source_image.size(),
-            content_snapshot=content_snapshot,
-            current_pan=current_pan,
+            source_image=source_image,
+            pyramid_scale=pyramid_scale,
+            frame=frame,
         )
         visibility = visible_source_rect_for_layer(
-            scene_bounds=scene.bounds,
-            layer_placement=layer.placement,
+            scene_bounds=compiled.scene.bounds,
+            layer_placement=layer.descriptor.placement,
             source_size=source_image.size(),
-            visible_scene_rect=visible_scene_rect,
-            clip=layer.clip,
+            visible_scene_rect=frame.visible_scene_rect,
+            clip=layer.descriptor.clip,
             viewport_rect=qpane_rect,
             item_transform=transform,
         )
         if visibility is None:
             return None
         return RasterLayerGeometry(
-            scene_id=scene.scene_id,
-            layer_id=layer.layer_id,
-            asset_key=asset_key,
-            pyramid_asset_key=pyramid_asset_key,
+            scene_id=compiled.scene.scene_id,
+            layer_id=layer.descriptor.layer_id,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
             pyramid_scale=pyramid_scale,
             transform=transform,
-            placement=layer.placement,
-            clip=layer.clip,
+            placement=layer.descriptor.placement,
+            clip=layer.descriptor.clip,
             source_size=source_image.size(),
             tile_size=self.tile_manager.tile_size,
             tile_overlap=self.tile_manager.tile_overlap,
@@ -835,158 +891,30 @@ class RenderingPresenter:
         """Reapply the current pan so it is clamped after a custom-mode resize."""
         self.viewport.setPan(self.viewport.pan)
 
-    def _calculate_base_raster_snapshot(
+    def _frame_geometry_for(
         self,
+        compiled: CompiledRenderScene,
         *,
         use_pan: QPointF | None,
-        is_blank: bool,
-    ) -> _BaseRasterSnapshot | None:
-        """Resolve the current catalog image into behavior-preserving raster data."""
-        if is_blank:
-            return None
-        active_content = self._cached_active_scene_content()
-        if active_content is None:
-            return None
-        base_image = active_content.base_image
-        content_snapshot = self._content_snapshot_for_active_content(active_content)
-        base_layer = self._first_image_layer(active_content.scene)
-        if base_layer is None:
-            return None
-        target_width = base_layer.placement.width * self.viewport.zoom
-        source_image = (
-            self._catalog.getBestFitImageForAsset(
-                active_content.pyramid_asset_key, target_width
-            )
-            if active_content.image_id is not None
-            else base_image
-        )
-        if source_image is None or source_image.isNull():
-            source_image = base_image
-        pyramid_scale = (
-            source_image.width() / base_image.width() if base_image.width() > 0 else 1.0
-        )
-        canvas_size_physical = (
-            QSizeF(base_layer.placement.width, base_layer.placement.height)
-            * self.viewport.zoom
-        )
+    ) -> _FrameGeometry:
+        """Return viewport-dependent geometry for one render-planning frame."""
+        current_pan = use_pan if use_pan is not None else self.viewport.pan
         physical_viewport_rect = self.physical_viewport_rect()
-        viewport_size_physical = QSizeF(physical_viewport_rect.size())
-        strategy = RenderStrategy.DIRECT
-        if (
-            canvas_size_physical.width() > viewport_size_physical.width()
-            or canvas_size_physical.height() > viewport_size_physical.height()
-        ):
-            strategy = RenderStrategy.TILE
-        pan_value = use_pan if use_pan is not None else self.viewport.pan
-        uses_default_base_tile_math = self._uses_default_base_tile_math(
-            scene=active_content.scene,
-            layer=base_layer,
-            full_image=base_image,
-        )
-        if uses_default_base_tile_math:
-            transform = self.viewport.get_transform(
-                source_image.size(),
-                pyramid_scale,
-                pan_override=use_pan,
-                content_snapshot=content_snapshot,
-            )
-        else:
-            transform = self._transform_for_placed_geometry(
-                scene=active_content.scene,
-                layer=base_layer,
-                source_size=source_image.size(),
-                content_snapshot=content_snapshot,
-                current_pan=pan_value,
-            )
-        render_hint_enabled = self.viewport.zoom < self.viewport.nativeZoom() * 2.0
-        visible_scene_rect = self._calculate_visible_scene_rect(
-            scene=active_content.scene,
+        return _FrameGeometry(
+            content_snapshot=compiled.content_snapshot,
             zoom=self.viewport.zoom,
-            current_pan=pan_value,
-            physical_viewport_rect=physical_viewport_rect,
-        )
-        debug_draw_tile_grid = self._qpane.settings.draw_tile_grid
-        tile_size = self.tile_manager.tile_size
-        tile_overlap = self.tile_manager.tile_overlap
-        max_cols = 0
-        max_rows = 0
-        tiles_to_draw: list[TileRenderData] = []
-        visible_range: tuple[int, int, int, int] | None = None
-        if strategy == RenderStrategy.TILE:
-            max_cols, max_rows = self.tile_manager.calculate_grid_dimensions(
-                source_image.width(), source_image.height()
-            )
-            if self._uses_default_base_tile_math(
-                scene=active_content.scene,
-                layer=base_layer,
-                full_image=base_image,
-            ):
-                visible_source_rect = self._calculate_default_visible_source_rect(
-                    source_size=source_image.size(),
-                    pyramid_scale=pyramid_scale,
-                    current_pan=pan_value,
-                    physical_viewport_rect=physical_viewport_rect,
-                )
-            else:
-                visibility = visible_source_rect_for_layer(
-                    scene_bounds=active_content.scene.bounds,
-                    layer_placement=base_layer.placement,
-                    source_size=source_image.size(),
-                    visible_scene_rect=visible_scene_rect,
-                    clip=base_layer.clip,
-                    viewport_rect=QRectF(self._qpane.rect()),
-                    item_transform=transform,
-                )
-                visible_source_rect = (
-                    visibility.source_rect if visibility is not None else QRectF()
-                )
-            visible_range = self._calculate_tile_range_for_source_rect(
-                source_rect=visible_source_rect,
-                tile_size=tile_size,
-                tile_overlap=tile_overlap,
-                max_cols=max_cols,
-                max_rows=max_rows,
-            )
-            start_row, end_row, start_col, end_col = visible_range
-            for row in range(start_row, end_row + 1):
-                for col in range(start_col, end_col + 1):
-                    tile_key = SceneLayerTileKey(
-                        asset_key=active_content.asset_key,
-                        pyramid_asset_key=active_content.pyramid_asset_key,
-                        pyramid_scale=pyramid_scale,
-                        row=row,
-                        col=col,
-                    )
-                    tile_image = self.tile_manager.get_tile(tile_key, source_image)
-                    if tile_image:
-                        draw_pos = self.get_tile_draw_position(tile_key)
-                        tiles_to_draw.append(TileRenderData(tile_image, draw_pos))
-        return _BaseRasterSnapshot(
-            base_image=base_image,
-            source_image=source_image,
-            scene=active_content.scene,
-            image_id=active_content.image_id,
-            source_path=active_content.source_path,
-            source_revision=active_content.source_revision,
-            asset_key=active_content.asset_key,
-            pyramid_asset_key=active_content.pyramid_asset_key,
-            content_snapshot=content_snapshot,
-            pyramid_scale=pyramid_scale,
-            transform=transform,
-            zoom=self.viewport.zoom,
-            strategy=strategy,
-            render_hint_enabled=render_hint_enabled,
-            debug_draw_tile_grid=debug_draw_tile_grid,
-            tiles_to_draw=tuple(tiles_to_draw),
-            tile_size=tile_size,
-            tile_overlap=tile_overlap,
-            max_tile_cols=max_cols,
-            max_tile_rows=max_rows,
+            current_pan=current_pan,
             qpane_rect=self._qpane.rect(),
-            current_pan=pan_value,
             physical_viewport_rect=physical_viewport_rect,
-            visible_scene_rect=visible_scene_rect,
-            visible_tile_range=visible_range,
+            visible_scene_rect=self._calculate_visible_scene_rect(
+                scene=compiled.scene,
+                zoom=self.viewport.zoom,
+                current_pan=current_pan,
+                physical_viewport_rect=physical_viewport_rect,
+            ),
+            debug_draw_tile_grid=self._qpane.settings.draw_tile_grid,
+            tile_size=self.tile_manager.tile_size,
+            tile_overlap=self.tile_manager.tile_overlap,
         )
 
     @staticmethod
@@ -1077,19 +1005,21 @@ class RenderingPresenter:
         )
         return SceneResolver(providers=tuple(providers)).resolve()
 
-    def _build_raster_render_items(
-        self, scene: SceneDescriptor, snapshot: _BaseRasterSnapshot
+    def _build_frame_raster_items(
+        self, compiled: CompiledRenderScene, frame: _FrameGeometry
     ) -> tuple[RasterLayerRenderItem, ...]:
-        """Build ordered raster render items from image layer descriptors."""
+        """Build ordered raster render items for one viewport frame."""
         items: list[RasterLayerRenderItem] = []
         visible_tile_keys: set[SceneLayerTileKey] = set()
-        for layer in scene.layers:
-            if not layer.visible or layer.kind != LayerKind.IMAGE:
-                continue
-            if self._is_snapshot_base_layer(scene, layer, snapshot):
-                result = self._build_base_raster_item(scene, layer, snapshot)
+        for layer in compiled.layers:
+            if layer.is_base_raster:
+                result = self._build_frame_base_raster_item(compiled, layer, frame)
             else:
-                result = self._build_additional_raster_item(scene, layer, snapshot)
+                result = self._build_frame_additional_raster_item(
+                    compiled,
+                    layer,
+                    frame,
+                )
             visible_tile_keys.update(result.visible_tile_keys)
             item = result.item
             if item is not None:
@@ -1108,194 +1038,265 @@ class RenderingPresenter:
                 return item
         return None
 
-    @staticmethod
-    def _is_snapshot_base_layer(
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        snapshot: _BaseRasterSnapshot,
-    ) -> bool:
-        """Return True when ``layer`` is the current default base raster."""
-        if scene.kind == SceneKind.PLACEHOLDER_IMAGE:
-            return layer.hit_test.role == "placeholder-image"
-        if not isinstance(layer.source, CatalogImageSource):
-            return False
-        if snapshot.image_id is None:
-            return False
-        return layer.layer_id == base_image_layer_id(snapshot.image_id)
-
-    def _build_base_raster_item(
+    def _build_frame_base_raster_item(
         self,
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        snapshot: _BaseRasterSnapshot,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
     ) -> _RasterPlanningResult:
-        """Build the behavior-preserving base image render item."""
-        visible_keys = self._visible_tile_keys_for_item(
-            asset_key=snapshot.asset_key,
-            pyramid_asset_key=snapshot.pyramid_asset_key,
-            pyramid_scale=snapshot.pyramid_scale,
-            visible_tile_range=snapshot.visible_tile_range,
-        )
-        item = RasterLayerRenderItem(
-            descriptor=layer,
-            source_image=snapshot.source_image,
-            asset_key=snapshot.asset_key,
-            pyramid_asset_key=snapshot.pyramid_asset_key,
-            pyramid_scale=snapshot.pyramid_scale,
-            transform=snapshot.transform,
-            placement=layer.placement,
-            clip=layer.clip,
-            strategy=snapshot.strategy,
-            render_hint_enabled=snapshot.render_hint_enabled,
-            debug_draw_tile_grid=snapshot.debug_draw_tile_grid,
-            tiles_to_draw=snapshot.tiles_to_draw,
-            tile_size=snapshot.tile_size,
-            tile_overlap=snapshot.tile_overlap,
-            max_tile_cols=snapshot.max_tile_cols,
-            max_tile_rows=snapshot.max_tile_rows,
-            visible_tile_range=snapshot.visible_tile_range,
-        )
-        return _RasterPlanningResult(
-            item=item, visible_tile_keys=frozenset(visible_keys)
-        )
-
-    def _build_additional_raster_item(
-        self,
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        snapshot: _BaseRasterSnapshot,
-    ) -> _RasterPlanningResult:
-        """Build a non-base image render item using the shared scene viewport."""
-        full_image = self._source_image_for_layer(layer)
-        if full_image is None or full_image.isNull():
-            return _RasterPlanningResult(item=None, visible_tile_keys=frozenset())
-        asset_key = self._render_asset_key_for_image_layer(scene, layer)
-        pyramid_asset_key = self._pyramid_asset_key_for_image_layer(scene, layer)
-        if pyramid_asset_key is None:
-            return _RasterPlanningResult(item=None, visible_tile_keys=frozenset())
-        target_width = layer.placement.width * self.viewport.zoom
+        """Build the behavior-preserving base image render item for one frame."""
         source_image = self._best_fit_image_for_layer(
-            layer,
-            asset_key=asset_key,
-            pyramid_asset_key=pyramid_asset_key,
-            full_image=full_image,
-            target_width=target_width,
+            layer.descriptor,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            full_image=layer.full_image,
+            target_width=layer.descriptor.placement.width * frame.zoom,
         )
         pyramid_scale = (
-            source_image.width() / full_image.width() if full_image.width() > 0 else 1.0
+            source_image.width() / layer.full_image.width()
+            if layer.full_image.width() > 0
+            else 1.0
         )
-        canvas_size_physical = (
-            QSizeF(layer.placement.width, layer.placement.height) * self.viewport.zoom
-        )
-        viewport_size_physical = snapshot.physical_viewport_rect.size()
-        strategy = RenderStrategy.DIRECT
-        if (
-            canvas_size_physical.width() > viewport_size_physical.width()
-            or canvas_size_physical.height() > viewport_size_physical.height()
-        ):
-            strategy = RenderStrategy.TILE
-        transform = self._transform_for_placed_layer(
-            scene=scene,
+        strategy = self._render_strategy_for_layer(layer.descriptor, frame)
+        transform = self._transform_for_compiled_layer(
+            compiled=compiled,
             layer=layer,
             source_image=source_image,
-            snapshot=snapshot,
+            pyramid_scale=pyramid_scale,
+            frame=frame,
         )
-        tiles_to_draw: list[TileRenderData] = []
-        visible_keys: set[SceneLayerTileKey] = set()
-        max_cols = 0
-        max_rows = 0
-        visible_range: tuple[int, int, int, int] | None = None
-        if strategy == RenderStrategy.TILE:
-            max_cols, max_rows = self.tile_manager.calculate_grid_dimensions(
-                source_image.width(),
-                source_image.height(),
-            )
-            visibility = visible_source_rect_for_layer(
-                scene_bounds=scene.bounds,
-                layer_placement=layer.placement,
-                source_size=source_image.size(),
-                visible_scene_rect=snapshot.visible_scene_rect,
-                clip=layer.clip,
-                viewport_rect=QRectF(snapshot.qpane_rect),
-                item_transform=transform,
-            )
-            visible_range = self._calculate_tile_range_for_source_rect(
-                source_rect=(
-                    visibility.source_rect if visibility is not None else QRectF()
-                ),
-                tile_size=snapshot.tile_size,
-                tile_overlap=snapshot.tile_overlap,
-                max_cols=max_cols,
-                max_rows=max_rows,
-            )
-            start_row, end_row, start_col, end_col = visible_range
-            for row in range(start_row, end_row + 1):
-                for col in range(start_col, end_col + 1):
-                    tile_key = SceneLayerTileKey(
-                        asset_key=asset_key,
-                        pyramid_asset_key=pyramid_asset_key,
-                        pyramid_scale=pyramid_scale,
-                        row=row,
-                        col=col,
-                    )
-                    visible_keys.add(tile_key)
-                    tile_image = self.tile_manager.get_tile(tile_key, source_image)
-                    if tile_image:
-                        tiles_to_draw.append(
-                            TileRenderData(
-                                tile_image,
-                                self.get_tile_draw_position(tile_key),
-                            )
-                        )
-        item = RasterLayerRenderItem(
-            descriptor=layer,
+        tile_plan = self._tile_plan_for_layer(
+            compiled=compiled,
+            layer=layer,
+            frame=frame,
             source_image=source_image,
-            asset_key=asset_key,
-            pyramid_asset_key=pyramid_asset_key,
             pyramid_scale=pyramid_scale,
             transform=transform,
-            placement=layer.placement,
-            clip=layer.clip,
+            strategy=strategy,
+        )
+        item = RasterLayerRenderItem(
+            descriptor=layer.descriptor,
+            source_image=source_image,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            pyramid_scale=pyramid_scale,
+            transform=transform,
+            placement=layer.descriptor.placement,
+            clip=layer.descriptor.clip,
+            strategy=strategy,
+            render_hint_enabled=self.viewport.zoom < self.viewport.nativeZoom() * 2.0,
+            debug_draw_tile_grid=frame.debug_draw_tile_grid,
+            tiles_to_draw=tile_plan.tiles_to_draw,
+            tile_size=frame.tile_size,
+            tile_overlap=frame.tile_overlap,
+            max_tile_cols=tile_plan.max_tile_cols,
+            max_tile_rows=tile_plan.max_tile_rows,
+            visible_tile_range=tile_plan.visible_tile_range,
+        )
+        return _RasterPlanningResult(
+            item=item, visible_tile_keys=tile_plan.visible_keys
+        )
+
+    def _build_frame_additional_raster_item(
+        self,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
+    ) -> _RasterPlanningResult:
+        """Build a non-base image render item using the shared scene frame."""
+        source_image = self._best_fit_image_for_layer(
+            layer.descriptor,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            full_image=layer.full_image,
+            target_width=layer.descriptor.placement.width * frame.zoom,
+        )
+        pyramid_scale = (
+            source_image.width() / layer.full_image.width()
+            if layer.full_image.width() > 0
+            else 1.0
+        )
+        strategy = self._render_strategy_for_layer(layer.descriptor, frame)
+        transform = self._transform_for_compiled_layer(
+            compiled=compiled,
+            layer=layer,
+            source_image=source_image,
+            pyramid_scale=pyramid_scale,
+            frame=frame,
+        )
+        tile_plan = self._tile_plan_for_layer(
+            compiled=compiled,
+            layer=layer,
+            frame=frame,
+            source_image=source_image,
+            pyramid_scale=pyramid_scale,
+            transform=transform,
+            strategy=strategy,
+        )
+        item = RasterLayerRenderItem(
+            descriptor=layer.descriptor,
+            source_image=source_image,
+            asset_key=layer.asset_key,
+            pyramid_asset_key=layer.pyramid_asset_key,
+            pyramid_scale=pyramid_scale,
+            transform=transform,
+            placement=layer.descriptor.placement,
+            clip=layer.descriptor.clip,
             strategy=strategy,
             render_hint_enabled=self._should_smooth_raster_item(
                 source_image.size(),
                 transform,
             ),
-            debug_draw_tile_grid=snapshot.debug_draw_tile_grid,
+            debug_draw_tile_grid=frame.debug_draw_tile_grid,
+            tiles_to_draw=tile_plan.tiles_to_draw,
+            tile_size=frame.tile_size,
+            tile_overlap=frame.tile_overlap,
+            max_tile_cols=tile_plan.max_tile_cols,
+            max_tile_rows=tile_plan.max_tile_rows,
+            visible_tile_range=tile_plan.visible_tile_range,
+        )
+        return _RasterPlanningResult(
+            item=item, visible_tile_keys=tile_plan.visible_keys
+        )
+
+    def _render_strategy_for_layer(
+        self,
+        layer: LayerDescriptor,
+        frame: _FrameGeometry,
+    ) -> RenderStrategy:
+        """Return the raster strategy for ``layer`` in the current frame."""
+        canvas_size_physical = (
+            QSizeF(layer.placement.width, layer.placement.height) * frame.zoom
+        )
+        viewport_size_physical = frame.physical_viewport_rect.size()
+        if (
+            canvas_size_physical.width() > viewport_size_physical.width()
+            or canvas_size_physical.height() > viewport_size_physical.height()
+        ):
+            return RenderStrategy.TILE
+        return RenderStrategy.DIRECT
+
+    def _transform_for_compiled_layer(
+        self,
+        *,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        source_image: QImage,
+        pyramid_scale: float,
+        frame: _FrameGeometry,
+    ) -> QTransform:
+        """Return the panel transform for a compiled layer in one frame."""
+        if layer.uses_default_base_tile_math:
+            return self.viewport.get_transform(
+                source_image.size(),
+                pyramid_scale,
+                pan_override=frame.current_pan,
+                content_snapshot=frame.content_snapshot,
+            )
+        return self._transform_for_placed_geometry(
+            scene=compiled.scene,
+            layer=layer.descriptor,
+            source_size=source_image.size(),
+            content_snapshot=frame.content_snapshot,
+            current_pan=frame.current_pan,
+        )
+
+    def _tile_plan_for_layer(
+        self,
+        *,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
+        source_image: QImage,
+        pyramid_scale: float,
+        transform: QTransform,
+        strategy: RenderStrategy,
+    ) -> _TilePlan:
+        """Return tile payloads and visible keys for one raster layer."""
+        if strategy == RenderStrategy.DIRECT:
+            return _TilePlan(
+                tiles_to_draw=(),
+                visible_keys=frozenset(),
+                max_tile_cols=0,
+                max_tile_rows=0,
+                visible_tile_range=None,
+            )
+        max_cols, max_rows = self.tile_manager.calculate_grid_dimensions(
+            source_image.width(),
+            source_image.height(),
+        )
+        visible_source_rect = self._visible_source_rect_for_tiled_layer(
+            compiled=compiled,
+            layer=layer,
+            frame=frame,
+            source_image=source_image,
+            pyramid_scale=pyramid_scale,
+            transform=transform,
+        )
+        visible_range = self._calculate_tile_range_for_source_rect(
+            source_rect=visible_source_rect,
+            tile_size=frame.tile_size,
+            tile_overlap=frame.tile_overlap,
+            max_cols=max_cols,
+            max_rows=max_rows,
+        )
+        tiles_to_draw: list[TileRenderData] = []
+        visible_keys: set[SceneLayerTileKey] = set()
+        start_row, end_row, start_col, end_col = visible_range
+        for row in range(start_row, end_row + 1):
+            for col in range(start_col, end_col + 1):
+                tile_key = SceneLayerTileKey(
+                    asset_key=layer.asset_key,
+                    pyramid_asset_key=layer.pyramid_asset_key,
+                    pyramid_scale=pyramid_scale,
+                    row=row,
+                    col=col,
+                )
+                visible_keys.add(tile_key)
+                tile_image = self.tile_manager.get_tile(tile_key, source_image)
+                if tile_image:
+                    tiles_to_draw.append(
+                        TileRenderData(
+                            tile_image,
+                            self.get_tile_draw_position(tile_key),
+                        )
+                    )
+        return _TilePlan(
             tiles_to_draw=tuple(tiles_to_draw),
-            tile_size=snapshot.tile_size,
-            tile_overlap=snapshot.tile_overlap,
+            visible_keys=frozenset(visible_keys),
             max_tile_cols=max_cols,
             max_tile_rows=max_rows,
             visible_tile_range=visible_range,
         )
-        return _RasterPlanningResult(
-            item=item, visible_tile_keys=frozenset(visible_keys)
-        )
 
-    @staticmethod
-    def _visible_tile_keys_for_item(
+    def _visible_source_rect_for_tiled_layer(
+        self,
         *,
-        asset_key: SceneLayerAssetKey,
-        pyramid_asset_key: SceneLayerAssetKey,
+        compiled: CompiledRenderScene,
+        layer: CompiledRenderLayer,
+        frame: _FrameGeometry,
+        source_image: QImage,
         pyramid_scale: float,
-        visible_tile_range: tuple[int, int, int, int] | None,
-    ) -> set[SceneLayerTileKey]:
-        """Return visible tile keys for an already-planned tiled raster item."""
-        if visible_tile_range is None:
-            return set()
-        start_row, end_row, start_col, end_col = visible_tile_range
-        return {
-            SceneLayerTileKey(
-                asset_key=asset_key,
-                pyramid_asset_key=pyramid_asset_key,
+        transform: QTransform,
+    ) -> QRectF:
+        """Return the source-space region visible for tiled rendering."""
+        if layer.uses_default_base_tile_math:
+            return self._calculate_default_visible_source_rect(
+                source_size=source_image.size(),
                 pyramid_scale=pyramid_scale,
-                row=row,
-                col=col,
+                current_pan=frame.current_pan,
+                physical_viewport_rect=frame.physical_viewport_rect,
             )
-            for row in range(start_row, end_row + 1)
-            for col in range(start_col, end_col + 1)
-        }
+        visibility = visible_source_rect_for_layer(
+            scene_bounds=compiled.scene.bounds,
+            layer_placement=layer.descriptor.placement,
+            source_size=source_image.size(),
+            visible_scene_rect=frame.visible_scene_rect,
+            clip=layer.descriptor.clip,
+            viewport_rect=QRectF(frame.qpane_rect),
+            item_transform=transform,
+        )
+        return visibility.source_rect if visibility is not None else QRectF()
 
     @staticmethod
     def _should_smooth_raster_item(
@@ -1315,52 +1316,6 @@ class RenderingPresenter:
         scale_y = abs(panel_rect.height() / source_height)
         effective_scale = max(scale_x, scale_y)
         return effective_scale < 2.0
-
-    def _transform_for_placed_layer(
-        self,
-        *,
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        source_image: QImage,
-        snapshot: _BaseRasterSnapshot,
-    ) -> QTransform:
-        """Map source pixels into the layer placement before viewport transform."""
-        scene_size = QSize(
-            max(1, round(scene.bounds.width)),
-            max(1, round(scene.bounds.height)),
-        )
-        transform = self.viewport.get_transform(
-            scene_size,
-            1.0,
-            pan_override=snapshot.current_pan,
-            content_snapshot=snapshot.content_snapshot,
-        )
-        transform.translate(
-            layer.placement.x - scene.bounds.x,
-            layer.placement.y - scene.bounds.y,
-        )
-        transform.scale(
-            layer.placement.width / source_image.width(),
-            layer.placement.height / source_image.height(),
-        )
-        return transform
-
-    def _transform_for_placed_size(
-        self,
-        *,
-        scene: SceneDescriptor,
-        layer: LayerDescriptor,
-        source_size: QSize,
-        snapshot: _BaseRasterSnapshot,
-    ) -> QTransform:
-        """Map a source size into the layer placement before viewport transform."""
-        return self._transform_for_placed_geometry(
-            scene=scene,
-            layer=layer,
-            source_size=source_size,
-            content_snapshot=snapshot.content_snapshot,
-            current_pan=snapshot.current_pan,
-        )
 
     def _transform_for_placed_geometry(
         self,
@@ -1519,21 +1474,29 @@ class RenderingPresenter:
             return QRectF()
         return inverse.mapRect(viewport_clip)
 
-    def _build_mask_render_items(
+    def _build_frame_mask_items(
         self,
-        scene: SceneDescriptor,
-        snapshot: _BaseRasterSnapshot,
+        compiled: CompiledRenderScene,
         base_item: RasterLayerRenderItem | None,
     ) -> tuple[MaskLayerRenderItem, ...]:
         """Build mask render items from resolved mask layer descriptors."""
         service = self._mask_service()
-        if service is None or base_item is None or snapshot.base_image.width() <= 0:
+        base_layer = next(
+            (layer for layer in compiled.layers if layer.is_base_raster),
+            None,
+        )
+        if (
+            service is None
+            or base_item is None
+            or base_layer is None
+            or base_layer.full_image.width() <= 0
+        ):
             return ()
-        scale = snapshot.source_image.width() / snapshot.base_image.width()
+        scale = base_item.source_image.width() / base_layer.full_image.width()
         if scale <= 0:
             scale = 1.0
         items: list[MaskLayerRenderItem] = []
-        for layer in scene.layers:
+        for layer in compiled.mask_layers:
             if (
                 not layer.visible
                 or layer.kind != LayerKind.MASK
@@ -1548,7 +1511,7 @@ class RenderingPresenter:
                     descriptor=layer,
                     pixmap=pixmap,
                     asset_key=mask_layer_asset_key(
-                        scene_id=scene.scene_id,
+                        scene_id=compiled.scene.scene_id,
                         mask_id=layer.source.mask_id,
                         revision=layer.source_revision,
                     ),
@@ -1619,13 +1582,16 @@ class RenderingPresenter:
         target_width: float,
     ) -> QImage:
         """Return the best available source image for a raster layer."""
-        return self._source_resolvers.best_fit_image(
+        source_image = self._source_resolvers.best_fit_image(
             layer.source,
             asset_key=asset_key,
             pyramid_asset_key=pyramid_asset_key,
             full_image=full_image,
             target_width=target_width,
         )
+        if source_image is None or source_image.isNull():
+            return full_image
+        return source_image
 
     def _resolve_active_scene_content(self) -> _ActiveSceneContent | None:
         """Resolve catalog or placeholder content without reading widget mirror state."""
@@ -1728,26 +1694,113 @@ class RenderingPresenter:
             pyramid_asset_key=pyramid_asset_key,
         )
 
-    def _cached_active_scene_content(self) -> _ActiveSceneContent | None:
-        """Return resolved active content, reusing it while scene identity is stable."""
-        cache_key = self._active_content_cache_key()
+    def _compiled_render_scene(self) -> CompiledRenderScene | None:
+        """Return cached static render data for the active scene graph."""
+        cache_key = self._compiled_scene_cache_key()
         if (
-            cache_key == self._cached_content_key
-            and self._cached_active_content is not None
+            cache_key == self._cached_compiled_scene_key
+            and self._cached_compiled_scene is not None
         ):
-            return self._cached_active_content
+            return self._cached_compiled_scene
         active_content = self._resolve_active_scene_content()
-        self._cached_content_key = cache_key
-        self._cached_active_content = active_content
-        self._cached_content_snapshot = (
-            self._content_snapshot_for_active_content(active_content)
+        compiled = (
+            self._compile_render_scene(active_content)
             if active_content is not None
             else None
         )
-        return active_content
+        self._cached_compiled_scene_key = cache_key
+        self._cached_compiled_scene = compiled
+        return compiled
 
-    def _active_content_cache_key(self) -> tuple[object, ...]:
-        """Return revision values that affect active scene/content geometry."""
+    def _compile_render_scene(
+        self,
+        active_content: _ActiveSceneContent,
+    ) -> CompiledRenderScene | None:
+        """Compile stable scene graph metadata for render planning."""
+        content_snapshot = self._content_snapshot_for_active_content(active_content)
+        base_layer = self._first_image_layer(active_content.scene)
+        if base_layer is None:
+            return None
+        image_layers: list[CompiledRenderLayer] = []
+        mask_layers: list[LayerDescriptor] = []
+        for layer in active_content.scene.layers:
+            if not layer.visible:
+                continue
+            if layer.kind == LayerKind.MASK:
+                mask_layers.append(layer)
+                continue
+            if layer.kind != LayerKind.IMAGE:
+                continue
+            compiled_layer = self._compile_render_layer(
+                active_content=active_content,
+                base_layer=base_layer,
+                layer=layer,
+            )
+            if compiled_layer is not None:
+                image_layers.append(compiled_layer)
+        if not image_layers:
+            return None
+        return CompiledRenderScene(
+            scene=active_content.scene,
+            content_snapshot=content_snapshot,
+            layers=tuple(image_layers),
+            mask_layers=tuple(mask_layers),
+            hit_test_items=hit_test_items_for_scene(active_content.scene),
+        )
+
+    def _compile_render_layer(
+        self,
+        *,
+        active_content: _ActiveSceneContent,
+        base_layer: LayerDescriptor,
+        layer: LayerDescriptor,
+    ) -> CompiledRenderLayer | None:
+        """Compile one image layer into static render-facing metadata."""
+        is_base_raster = layer.layer_id == base_layer.layer_id
+        full_image = (
+            active_content.base_image
+            if is_base_raster
+            else self._source_image_for_layer(layer)
+        )
+        if full_image is None or full_image.isNull():
+            return None
+        asset_key = (
+            active_content.asset_key
+            if is_base_raster
+            else self._render_asset_key_for_image_layer(active_content.scene, layer)
+        )
+        pyramid_asset_key = (
+            active_content.pyramid_asset_key
+            if is_base_raster
+            else self._pyramid_asset_key_for_image_layer(active_content.scene, layer)
+        )
+        if pyramid_asset_key is None:
+            return None
+        source_path = (
+            active_content.source_path
+            if is_base_raster
+            else self._source_resolvers.source_path(layer.source)
+        )
+        return CompiledRenderLayer(
+            descriptor=layer,
+            asset_key=asset_key,
+            pyramid_asset_key=pyramid_asset_key,
+            full_image=full_image,
+            source_path=source_path,
+            source_revision=layer.source_revision,
+            is_base_raster=is_base_raster,
+            uses_default_base_tile_math=(
+                is_base_raster
+                and self._uses_default_base_tile_math(
+                    scene=active_content.scene,
+                    layer=layer,
+                    full_image=full_image,
+                )
+            ),
+        )
+
+    def _compiled_scene_cache_key(self) -> tuple[object, ...]:
+        """Return revision values that affect compiled scene/content metadata."""
         current_id = self._catalog.getCurrentId()
         source_path = self._catalog.getCurrentPath() if current_id is not None else None
         source_revision = self._catalog_revision(current_id)
@@ -1854,57 +1907,6 @@ class RenderingPresenter:
                 if candidate.visible and candidate.kind == LayerKind.IMAGE
             ),
             None,
-        )
-
-    @staticmethod
-    def _hit_test_items_for_scene(
-        scene: SceneDescriptor,
-    ) -> tuple[SceneHitTestItem, ...]:
-        """Project layer hit-test descriptors into render-plan metadata."""
-        return tuple(
-            SceneHitTestItem(
-                scene_id=scene.scene_id,
-                layer_id=layer.layer_id,
-                bounds=layer.placement,
-                enabled=layer.hit_test.enabled,
-                selectable=layer.hit_test.selectable,
-                role=layer.hit_test.role,
-                source=layer.source,
-            )
-            for layer in scene.layers
-            if layer.hit_test.enabled
-        )
-
-    def _cached_hit_test_items_for_scene(
-        self,
-        scene: SceneDescriptor,
-    ) -> tuple[SceneHitTestItem, ...]:
-        """Return cached hit-test metadata while scene hit-test inputs are stable."""
-        cache_key = self._hit_test_cache_key(scene)
-        if cache_key == self._cached_hit_test_key:
-            return self._cached_hit_test_items
-        items = self._hit_test_items_for_scene(scene)
-        self._cached_hit_test_key = cache_key
-        self._cached_hit_test_items = items
-        return items
-
-    @staticmethod
-    def _hit_test_cache_key(scene: SceneDescriptor) -> tuple[object, ...]:
-        """Return stable scene fields that affect hit-test metadata projection."""
-        return (
-            scene.scene_id,
-            tuple(
-                (
-                    layer.layer_id,
-                    layer.placement,
-                    layer.hit_test.enabled,
-                    layer.hit_test.selectable,
-                    layer.hit_test.role,
-                    layer.source,
-                    layer.source_revision,
-                )
-                for layer in scene.layers
-            ),
         )
 
     def _catalog_revision(self, image_id: uuid.UUID | None) -> int:

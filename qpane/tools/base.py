@@ -215,6 +215,10 @@ class CursorTool(BaseTool):
 class PanZoomTool(BaseTool):
     """Default tool that handles drag panning, wheel zooming, and fit toggling."""
 
+    _WHEEL_UNITS_PER_STEP = 120.0
+    _WHEEL_ZOOM_IN_FACTOR = 1.25
+    _WHEEL_ZOOM_OUT_FACTOR = 0.8
+
     def __init__(self):
         """Prepare pan/zoom state and dependency defaults."""
         super().__init__()
@@ -309,6 +313,7 @@ class PanZoomTool(BaseTool):
         if should_emit:
             self.signals.drag_start_maybe_requested.emit(event)
             return
+        was_panning = self.panning
         if (
             event.buttons() & Qt.MouseButton.LeftButton
             and self.last_mouse_pos is not None
@@ -319,7 +324,8 @@ class PanZoomTool(BaseTool):
             new_pan = self._get_pan() + self._logical_delta_to_physical(delta)
             self.signals.pan_requested.emit(new_pan)
         self.last_mouse_pos = event.position()
-        self.signals.cursor_update_requested.emit()
+        if was_panning != self.panning:
+            self.signals.cursor_update_requested.emit()
 
     def _logical_delta_to_physical(self, delta: QPointF) -> QPointF:
         """Scale a logical-pixel delta by DPR so pan stays in physical pixels."""
@@ -400,7 +406,7 @@ class PanZoomTool(BaseTool):
             self._set_zoom_one_to_one(event.position())
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Request zoom adjustments around the pointer using wheel deltas (1.25 for up, 0.8 for down).
+        """Request zoom adjustments around the pointer using wheel delta magnitude.
 
         Snaps to native 1:1 or fit zoom when a wheel step crosses them.
         """
@@ -411,11 +417,19 @@ class PanZoomTool(BaseTool):
         angle = event.angleDelta().y()
         if angle == 0:
             return
-        factor = 1.25 if angle > 0 else 0.8
+        wheel_steps = abs(angle) / self._WHEEL_UNITS_PER_STEP
+        step_factor = (
+            self._WHEEL_ZOOM_IN_FACTOR if angle > 0 else self._WHEEL_ZOOM_OUT_FACTOR
+        )
+        factor = step_factor**wheel_steps
         anchor = event.position()
         old_zoom = self._get_zoom()
         new_zoom, snap_mode = self._snap_zoom(old_zoom, old_zoom * factor)
         if snap_mode is not None:
             self.signals.zoom_snap_requested.emit(new_zoom, anchor, snap_mode)
+            if hasattr(event, "accept"):
+                event.accept()
             return
         self.signals.zoom_requested.emit(new_zoom, anchor)
+        if hasattr(event, "accept"):
+            event.accept()

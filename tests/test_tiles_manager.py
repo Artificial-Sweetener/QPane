@@ -273,7 +273,7 @@ def test_get_tile_queues_executor_and_populates_cache(qapp) -> None:
     result = manager.get_tile(identifier, source_image)
     assert result is None
     pending = list(executor.pending_tasks())
-    assert pending and pending[0].handle.category == "tiles"
+    assert pending and pending[0].handle.category == "tiles_visible"
     executor.run_task(pending[0].handle.task_id)
     qapp.processEvents()
     cached = manager.get_tile(identifier, source_image)
@@ -399,7 +399,7 @@ def test_tile_manager_shutdown_does_not_stop_shared_executor() -> None:
 def test_tile_manager_retries_after_throttle(qapp) -> None:
     """TileManager should retry submissions that were initially throttled."""
     config = Config(cache={"tiles": {"mb": 8}})
-    executor = RejectingStubExecutor(reject_counts={"tiles": 1})
+    executor = RejectingStubExecutor(reject_counts={"tiles_visible": 1})
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(128, 128, QImage.Format_ARGB32)
     source_image.fill(0)
@@ -424,7 +424,8 @@ def test_tile_manager_retries_after_throttle(qapp) -> None:
 
     wait_for(
         lambda: any(
-            record.handle.category == "tiles" for record in executor.pending_tasks()
+            record.handle.category == "tiles_visible"
+            for record in executor.pending_tasks()
         )
     )
     pending = list(executor.pending_tasks())
@@ -454,7 +455,7 @@ def test_prefetch_tiles_counts_cache_hits(qapp):
 @pytest.mark.usefixtures("qapp")
 def test_prefetch_tiles_handles_throttled_requests(qapp):
     config = Config(cache={"tiles": {"mb": 8}})
-    executor = RejectingStubExecutor(reject_counts={"tiles": 1})
+    executor = RejectingStubExecutor(reject_counts={"tiles_prefetch": 1})
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(64, 64, QImage.Format_ARGB32)
     source_image.fill(0)
@@ -474,7 +475,7 @@ def test_prefetch_tiles_handles_throttled_requests(qapp):
 @pytest.mark.usefixtures("qapp")
 def test_remove_tiles_for_asset_cancels_matching_pending_retries(qapp):
     config = Config(cache={"tiles": {"mb": 8}})
-    executor = RejectingStubExecutor(reject_counts={"tiles": 1})
+    executor = RejectingStubExecutor(reject_counts={"tiles_prefetch": 1})
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(64, 64, QImage.Format_ARGB32)
     source_image.fill(0)

@@ -445,10 +445,13 @@ class ToolInteractionDelegate:
 
     def handle_mouse_move(self, event: QMouseEvent) -> None:
         """Forward mouse move events to the active tool."""
-        if self._qpane.comparisonDividerInteraction().handle_mouse_move(event):
+        divider = self._qpane.comparisonDividerInteraction()
+        had_divider_cursor = divider.owns_cursor()
+        if divider.handle_mouse_move(event):
             self.update_cursor()
             return
-        self.update_cursor()
+        if had_divider_cursor or divider.owns_cursor():
+            self.update_cursor()
         self._forward_tool_event(self._qpane._tools_manager.mouseMoveEvent, event)
 
     def handle_mouse_release(self, event: QMouseEvent) -> None:

@@ -18,7 +18,7 @@
 
 from unittest.mock import MagicMock, patch
 import pytest
-from PySide6.QtCore import QPointF, QRectF, QSize
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtWidgets import QWidget
 
 from qpane.core import Config
@@ -120,6 +120,12 @@ def test_smooth_zoom_interpolation(viewport_setup):
 
         assert viewport.zoom == pytest.approx(2.0, abs=0.001)
         assert viewport._zoom_anim_pending is False
+
+
+def test_zoom_animation_timer_uses_precise_timer(viewport_setup):
+    """Smooth zoom should use a precise timer for steadier animation cadence."""
+    viewport, _ = viewport_setup
+    assert viewport._zoom_anim_timer.timerType() == Qt.TimerType.PreciseTimer
 
 
 def test_smooth_zoom_clamping(viewport_setup):
@@ -334,6 +340,33 @@ def test_apply_zoom_interpolated_burst_skips_animation(viewport_setup):
         fit_zoom=None,
     )
     assert viewport.zoom == 2.0
+    assert viewport._zoom_anim_pending is False
+
+
+def test_active_zoom_animation_burst_request_applies_immediately(viewport_setup):
+    """Burst requests during an active animation should interrupt and apply."""
+    viewport, _ = viewport_setup
+    viewport._smooth_zoom_burst_threshold_ms = 30.0
+    viewport._smooth_zoom_burst_duration_ms = 10
+    viewport.zoom = 1.0
+    viewport.pan = QPointF(0, 0)
+    viewport._zoom_anim_min_frame_ms = 16
+    viewport._start_zoom_animation(
+        target_zoom=2.0,
+        anchor=None,
+        duration_ms=80,
+        min_frame_ms=16,
+        target_pan=None,
+    )
+    viewport._apply_zoom_interpolated(
+        requested_zoom=3.0,
+        anchor=None,
+        target_mode=ViewportZoomMode.CUSTOM,
+        request_delta_ms=10.0,
+        target_pan=None,
+        fit_zoom=None,
+    )
+    assert viewport.zoom == 3.0
     assert viewport._zoom_anim_pending is False
 
 

@@ -147,6 +147,10 @@ class View:
         """Forward dirty-region tracking to the presenter."""
         self.presenter.mark_dirty(dirty_rect)
 
+    def handle_viewport_changed(self) -> bool:
+        """Let rendering handle a viewport change when a fast path is available."""
+        return self.presenter.handle_viewport_changed()
+
     def ensure_view_alignment(self, *, force: bool = False) -> None:
         """Keep the viewport aligned via the presenter helper."""
         self.presenter.ensure_view_alignment(force=force)

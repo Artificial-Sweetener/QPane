@@ -25,6 +25,7 @@ from PySide6.QtGui import QImage, QPixmap, Qt
 from PySide6.QtWidgets import QWidget
 
 from qpane.core import CacheSettings
+import qpane.rendering.presenter as presenter_module
 from qpane.rendering import (
     RenderingPresenter,
     ViewportZoomMode,
@@ -218,6 +219,16 @@ class StubCatalog:
 
     def getCurrentPath(self):  # pragma: no cover - simple passthrough
         return self._current_path
+
+    def getImage(self, image_id):  # pragma: no cover - resolver passthrough
+        if image_id == self._current_image_id:
+            return self._base_image
+        return None
+
+    def getPath(self, image_id):  # pragma: no cover - resolver passthrough
+        if image_id == self._current_image_id:
+            return self._current_path
+        return None
 
 
 class _NullHandle:
@@ -708,7 +719,7 @@ def test_calculate_render_plan_reuses_cached_active_content(qapp, monkeypatch):
         _cleanup_qpane(harness.qpane, qapp)
 
 
-def test_calculate_render_plan_reuses_cached_hit_test_projection(qapp, monkeypatch):
+def test_calculate_render_plan_reuses_compiled_hit_test_projection(qapp, monkeypatch):
     """Repeated paint planning should not rebuild stable hit-test metadata."""
     harness = PresenterHarness(
         qpane_size=(300, 200),
@@ -717,14 +728,18 @@ def test_calculate_render_plan_reuses_cached_hit_test_projection(qapp, monkeypat
     )
     try:
         presenter = harness.presenter
-        original = presenter._hit_test_items_for_scene
+        original = presenter_module.hit_test_items_for_scene
         calls = []
 
         def project_once(scene):
             calls.append("project")
             return original(scene)
 
-        monkeypatch.setattr(presenter, "_hit_test_items_for_scene", project_once)
+        monkeypatch.setattr(
+            presenter_module,
+            "hit_test_items_for_scene",
+            project_once,
+        )
 
         first = presenter.calculateRenderPlan(is_blank=False)
         second = presenter.calculateRenderPlan(is_blank=False)
@@ -739,6 +754,82 @@ def test_calculate_render_plan_reuses_cached_hit_test_projection(qapp, monkeypat
 
         assert third is not None
         assert len(calls) == 2
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_calculate_render_plan_reuses_compiled_scene_across_pan_frames(
+    qapp,
+    monkeypatch,
+):
+    """Pan-only planning should reuse compiled scene topology."""
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(4096, 4096),
+        color=Qt.blue,
+    )
+    try:
+        presenter = harness.presenter
+        original = presenter._compile_render_scene
+        calls = []
+
+        def compile_once(active_content):
+            calls.append("compile")
+            return original(active_content)
+
+        monkeypatch.setattr(presenter, "_compile_render_scene", compile_once)
+
+        harness.viewport.zoom = 1.5
+        harness.viewport.pan = QPointF(0.0, 0.0)
+        first = presenter.calculateRenderPlan(is_blank=False)
+        harness.viewport.pan = QPointF(48.0, -24.0)
+        second = presenter.calculateRenderPlan(is_blank=False)
+
+        assert first is not None
+        assert second is not None
+        assert calls == ["compile"]
+        assert first.scene_id == second.scene_id
+        assert first.hit_test_items is second.hit_test_items
+        assert first.base_raster_item is not None
+        assert second.base_raster_item is not None
+        assert (
+            first.base_raster_item.descriptor.layer_id
+            == second.base_raster_item.descriptor.layer_id
+        )
+        assert first.base_raster_item.asset_key == second.base_raster_item.asset_key
+        assert first.current_pan != second.current_pan
+    finally:
+        _cleanup_qpane(harness.qpane, qapp)
+
+
+def test_calculate_render_plan_reuses_scene_topology_across_zoom_frames(qapp):
+    """Zoom-only planning should keep scene identity stable while frame data changes."""
+    harness = PresenterHarness(
+        qpane_size=(300, 200),
+        image_size=(4096, 4096),
+        color=Qt.blue,
+    )
+    try:
+        presenter = harness.presenter
+        harness.viewport.zoom = 0.5
+        first = presenter.calculateRenderPlan(is_blank=False)
+        harness.viewport.zoom = 2.0
+        second = presenter.calculateRenderPlan(is_blank=False)
+
+        assert first is not None
+        assert second is not None
+        assert first.scene_id == second.scene_id
+        assert first.hit_test_items is second.hit_test_items
+        assert first.base_raster_item is not None
+        assert second.base_raster_item is not None
+        assert (
+            first.base_raster_item.descriptor.layer_id
+            == second.base_raster_item.descriptor.layer_id
+        )
+        assert first.zoom != second.zoom
+        assert first.base_raster_item.visible_tile_range != (
+            second.base_raster_item.visible_tile_range
+        )
     finally:
         _cleanup_qpane(harness.qpane, qapp)
 

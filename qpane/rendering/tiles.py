@@ -308,12 +308,19 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         ):
             self._schedule_cache_eviction()
 
-    def get_tile(self, key: SceneLayerTileKey, source_image: QImage) -> QImage | None:
+    def get_tile(
+        self,
+        key: SceneLayerTileKey,
+        source_image: QImage,
+        *,
+        prefetch: bool = False,
+    ) -> QImage | None:
         """Retrieves a tile image from the cache or starts a worker to generate it.
 
         Args:
             key: The scene/layer-aware key for the tile.
             source_image: The QImage to crop from if generation is needed.
+            prefetch: Submit newly generated work on the lower-priority prefetch lane.
 
         Returns:
             The cached QImage if present, or None if generation is pending.
@@ -336,6 +343,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             return None
         self._cache_misses += 1
         self._payload_waiters.setdefault(payload_key, set()).add(key)
+        category = "tiles_prefetch" if prefetch else "tiles_visible"
         # Route through shared retry controller; attempt immediate submit
 
         def _submit(img: QImage, attempt: int):
@@ -351,7 +359,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             executor = self._executor
             if executor is None:
                 raise RuntimeError("TileManager executor is missing")
-            handle = executor.submit(worker, category="tiles")
+            handle = executor.submit(worker, category=category)
             self._mark_generating(key, worker, handle, payload_key=payload_key)
             logger.debug("Queued tile generation for %s (via RetryController)", key)
             return handle
@@ -604,7 +612,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
                 continue
             self._prefetch_begin(key, record_start=False)
             try:
-                self.get_tile(key, source_image)
+                self.get_tile(key, source_image, prefetch=True)
             except Exception:
                 self._prefetch_finish(key, success=False)
                 raise

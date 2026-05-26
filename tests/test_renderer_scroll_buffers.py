@@ -21,15 +21,29 @@ import math
 import uuid
 
 import pytest
-from PySide6.QtCore import QPointF, QRect
+from PySide6.QtCore import QPointF, QRect, QRectF
 from PySide6.QtGui import QImage, QPixmap, Qt
 
-from qpane import QPane
+from qpane import (
+    QPane,
+    QPaneCatalogImageLayerRequest,
+    QPaneSceneClip,
+    QPaneSceneRequest,
+)
 from qpane.rendering.render import Renderer
 from qpane.scene.identity import mask_layer_asset_key
 from qpane.scene.model import ClipCoordinateSpace, LayerClip, LayerKind
-from qpane.scene.render_plan import MaskLayerRenderItem
+from qpane.scene.render_plan import (
+    MaskLayerRenderItem,
+    RenderStrategy,
+    TileRenderData,
+)
 from qpane.scene.sources import MaskLayerSource
+from tests.helpers.render_compare import (
+    assert_images_match,
+    checker_image,
+    rendered_widget_frame,
+)
 from tests.helpers.render_plan import make_render_plan
 
 
@@ -74,6 +88,55 @@ def _make_mask_plan(qpane_rect: QRect):
         scale=1.0,
     )
     return replace(plan, render_items=(base_item, mask_item)), mask_item
+
+
+def _render_clean_frame(qpane: QPane, pan: QPointF) -> QImage:
+    """Return a full-redraw frame for ``pan`` using the live renderer."""
+    view = qpane.view()
+    renderer = view.renderer
+    view.allocate_buffers()
+    view.viewport.pan = QPointF(pan)
+    renderer.markDirty()
+    plan = view.calculateRenderPlan(use_pan=pan, is_blank=False)
+    assert plan is not None
+    renderer.paint(plan)
+    buffer = renderer.get_base_buffer()
+    assert buffer is not None
+    return rendered_widget_frame(QImage(buffer), renderer.get_subpixel_pan_offset())
+
+
+def _render_scrolled_frame(
+    qpane: QPane,
+    *,
+    start_pan: QPointF,
+    target_pan: QPointF,
+) -> QImage:
+    """Return a frame produced by scroll-buffer repair from start to target pan."""
+    view = qpane.view()
+    renderer = view.renderer
+    view.allocate_buffers()
+    view.viewport.pan = QPointF(start_pan)
+    renderer.markDirty()
+    start_plan = view.calculateRenderPlan(use_pan=start_pan, is_blank=False)
+    assert start_plan is not None
+    renderer.paint(start_plan)
+    view.viewport.pan = QPointF(target_pan)
+    assert renderer.tryScrollBuffers(target_pan) is True
+    buffer = renderer.get_base_buffer()
+    assert buffer is not None
+    return rendered_widget_frame(QImage(buffer), renderer.get_subpixel_pan_offset())
+
+
+def _make_qpane_with_checker_image(qapp, *, size: int = 256) -> QPane:
+    """Return a QPane containing one high-contrast image."""
+    qpane = QPane(features=())
+    qpane.resize(128, 128)
+    image = checker_image(QRect(0, 0, size, size).size())
+    image_id = uuid.uuid4()
+    qpane.setImagesByID(QPane.imageMapFromLists([image], [None], [image_id]), image_id)
+    qpane.setZoom1To1()
+    qapp.processEvents()
+    return qpane
 
 
 def test_try_scroll_buffers_uses_qpane_render_plan(qpane_with_image, monkeypatch):
@@ -130,6 +193,250 @@ def test_base_scroll_strip_repair_uses_direct_fast_path(
     renderer._repair_base_buffer_strips([qpane.rect()], plan)
 
     assert calls == [([qpane.rect()], plan)]
+
+
+def test_tiled_base_scroll_strip_repair_uses_layered_tile_path(
+    qpane_with_image,
+    monkeypatch,
+) -> None:
+    """Tiled base layers must not use direct-source strip repair."""
+    qpane = qpane_with_image
+    renderer = qpane.view().renderer
+    tile_image = QImage(64, 64, QImage.Format_ARGB32_Premultiplied)
+    tile_image.fill(Qt.white)
+    plan = make_render_plan(
+        qpane.rect(),
+        strategy=RenderStrategy.TILE,
+        tiles_to_draw=(TileRenderData(tile_image, QPointF(0.0, 0.0)),),
+        visible_tile_range=(0, 0, 0, 0),
+    )
+    calls = []
+
+    def fail_direct_repair(*_args, **_kwargs):
+        raise AssertionError("tiled strip repair must not use direct source drawing")
+
+    monkeypatch.setattr(
+        renderer, "_repair_base_raster_strips_directly", fail_direct_repair
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_repair_layered_strips",
+        lambda rects, repair_plan: calls.append((rects, repair_plan)) or True,
+    )
+
+    assert renderer._can_repair_base_strips_directly(plan) is False
+    assert renderer._repair_base_buffer_strips([qpane.rect()], plan) is True
+    assert calls == [([qpane.rect()], plan)]
+
+
+def test_default_scene_scroll_repair_matches_full_redraw(qapp) -> None:
+    """Default scene pan repair should match a clean full redraw."""
+    qpane = _make_qpane_with_checker_image(qapp)
+    try:
+        start_pan = QPointF(0.0, 0.0)
+        target_pan = QPointF(7.0, 5.0)
+        expected = _render_clean_frame(qpane, target_pan)
+        actual = _render_scrolled_frame(
+            qpane,
+            start_pan=start_pan,
+            target_pan=target_pan,
+        )
+        assert_images_match(actual, expected)
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_pan_uses_scroll_buffer_reuse(qapp) -> None:
+    """Pan-only viewport changes should use renderer-owned scroll reuse."""
+    qpane = _make_qpane_with_checker_image(qapp)
+    try:
+        presenter = qpane.view().presenter
+        presenter.paint(
+            is_blank=False,
+            content_overlays={},
+            scene_overlays={},
+            overlays_suspended=False,
+            draw_tool_overlay=None,
+        )
+        renderer = qpane.view().renderer
+        before = renderer.snapshot_metrics()
+        qpane.setPan(QPointF(6.0, 0.0))
+        after = renderer.snapshot_metrics()
+        assert after.scroll_attempts == before.scroll_attempts + 1
+        assert after.scroll_hits == before.scroll_hits + 1
+        assert after.full_redraws == before.full_redraws
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_pan_falls_back_to_full_dirty_when_scroll_repair_fails(
+    qapp,
+    monkeypatch,
+) -> None:
+    """Failed strip repair should schedule a full redraw instead of leaving stale pixels."""
+    qpane = _make_qpane_with_checker_image(qapp)
+    try:
+        presenter = qpane.view().presenter
+        presenter.paint(
+            is_blank=False,
+            content_overlays={},
+            scene_overlays={},
+            overlays_suspended=False,
+            draw_tool_overlay=None,
+        )
+        renderer = qpane.view().renderer
+        before = renderer.snapshot_metrics()
+        monkeypatch.setattr(
+            renderer,
+            "_repair_base_buffer_strips",
+            lambda _rects, _plan: False,
+        )
+        qpane.setPan(QPointF(6.0, 0.0))
+        after = renderer.snapshot_metrics()
+        assert after.scroll_attempts == before.scroll_attempts + 1
+        assert after.scroll_misses == before.scroll_misses + 1
+        assert not renderer._dirty_region.isEmpty()
+        assert renderer._dirty_region.boundingRect().contains(qpane.rect())
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+def test_scroll_repair_failure_restores_original_buffer(qapp, monkeypatch) -> None:
+    """A failed repair must roll back the already-scrolled backing buffer."""
+    qpane = _make_qpane_with_checker_image(qapp)
+    try:
+        view = qpane.view()
+        renderer = view.renderer
+        view.allocate_buffers()
+        start_pan = QPointF(0.0, 0.0)
+        view.viewport.pan = QPointF(start_pan)
+        renderer.markDirty()
+        start_plan = view.calculateRenderPlan(use_pan=start_pan, is_blank=False)
+        assert start_plan is not None
+        renderer.paint(start_plan)
+        original_buffer = QImage(renderer.get_base_buffer())
+        original_buffer_pan = QPointF(renderer._buffer_pan)
+        monkeypatch.setattr(
+            renderer,
+            "_repair_base_buffer_strips",
+            lambda _rects, _plan: False,
+        )
+        assert renderer.tryScrollBuffers(QPointF(9.0, 0.0)) is False
+        assert renderer._buffer_pan == original_buffer_pan
+        restored_buffer = renderer.get_base_buffer()
+        assert restored_buffer is not None
+        assert_images_match(QImage(restored_buffer), original_buffer)
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+def test_public_scene_scroll_repair_matches_full_redraw(qapp) -> None:
+    """Multi-layer public scene pan repair should match a clean full redraw."""
+    qpane = QPane(features=())
+    try:
+        qpane.resize(96, 96)
+        first_id = uuid.uuid4()
+        second_id = uuid.uuid4()
+        first = checker_image(QRect(0, 0, 128, 128).size())
+        second = checker_image(QRect(0, 0, 128, 128).size())
+        qpane.setImagesByID(
+            QPane.imageMapFromLists(
+                [first, second],
+                [None, None],
+                [first_id, second_id],
+            ),
+            first_id,
+        )
+        request = QPaneSceneRequest(
+            composition_id=None,
+            title="Scroll repair scene",
+            bounds=QRectF(0.0, 0.0, 256.0, 128.0),
+            layers=(
+                QPaneCatalogImageLayerRequest(
+                    layer_id=uuid.uuid4(),
+                    image_id=first_id,
+                    placement=QRectF(0.0, 0.0, 128.0, 128.0),
+                ),
+                QPaneCatalogImageLayerRequest(
+                    layer_id=uuid.uuid4(),
+                    image_id=second_id,
+                    placement=QRectF(128.0, 0.0, 128.0, 128.0),
+                ),
+            ),
+        )
+        qpane.composeScene(request)
+        qpane.setZoom1To1()
+        start_pan = QPointF(0.0, 0.0)
+        target_pan = QPointF(9.0, 4.0)
+        expected = _render_clean_frame(qpane, target_pan)
+        actual = _render_scrolled_frame(
+            qpane,
+            start_pan=start_pan,
+            target_pan=target_pan,
+        )
+        assert_images_match(actual, expected)
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+def test_clipped_public_scene_scroll_repair_matches_full_redraw(qapp) -> None:
+    """Clipped scene layers should repair pan strips to the same pixels as redraw."""
+    qpane = QPane(features=())
+    try:
+        qpane.resize(96, 96)
+        first_id = uuid.uuid4()
+        second_id = uuid.uuid4()
+        first = checker_image(QRect(0, 0, 128, 128).size())
+        second = checker_image(QRect(0, 0, 128, 128).size())
+        second.invertPixels()
+        qpane.setImagesByID(
+            QPane.imageMapFromLists(
+                [first, second],
+                [None, None],
+                [first_id, second_id],
+            ),
+            first_id,
+        )
+        request = QPaneSceneRequest(
+            composition_id=None,
+            title="Clipped scroll repair scene",
+            bounds=QRectF(0.0, 0.0, 128.0, 128.0),
+            layers=(
+                QPaneCatalogImageLayerRequest(
+                    layer_id=uuid.uuid4(),
+                    image_id=first_id,
+                    placement=QRectF(0.0, 0.0, 128.0, 128.0),
+                ),
+                QPaneCatalogImageLayerRequest(
+                    layer_id=uuid.uuid4(),
+                    image_id=second_id,
+                    placement=QRectF(0.0, 0.0, 128.0, 128.0),
+                    clip=QPaneSceneClip(
+                        "scene",
+                        QRectF(48.0, 0.0, 80.0, 128.0),
+                    ),
+                ),
+            ),
+        )
+        qpane.composeScene(request)
+        qpane.setZoom1To1()
+        start_pan = QPointF(0.0, 0.0)
+        target_pan = QPointF(8.0, 6.0)
+        expected = _render_clean_frame(qpane, target_pan)
+        actual = _render_scrolled_frame(
+            qpane,
+            start_pan=start_pan,
+            target_pan=target_pan,
+        )
+        assert_images_match(actual, expected)
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
 
 
 def test_base_only_predicate_accepts_default_raster_plan() -> None:

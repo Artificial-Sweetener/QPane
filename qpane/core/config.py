@@ -624,8 +624,10 @@ _DEFAULTS: dict[str, Any] = {
     "concurrency": {
         "max_workers": 2,
         "category_priorities": {
-            "pyramid": 20,
-            "tiles": 30,
+            "tiles_visible": 40,
+            "pyramid": 30,
+            "tiles_prefetch": 20,
+            "tiles": 20,
             "io": 10,
             "sam": 5,
             "maintenance": 0,
