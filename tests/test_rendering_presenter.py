@@ -1010,6 +1010,12 @@ def test_presenter_paint_reallocates_when_buffer_size_stale(monkeypatch, qapp):
             def get_subpixel_pan_offset(self) -> QPointF:
                 return QPointF(0, 0)
 
+            def draw_base_buffer(self, painter) -> None:
+                painter.drawImage(0, 0, self._buffer)
+
+            def buffer_matches_viewport(self, size, dpr) -> bool:
+                return self._buffer.size() == size
+
             def allocate_buffers(self, size, dpr):
                 self.allocations += 1
                 self._buffer = QImage(
@@ -1067,6 +1073,12 @@ def test_presenter_paint_skips_allocation_when_buffer_size_matches(monkeypatch, 
             def get_subpixel_pan_offset(self) -> QPointF:
                 return QPointF(0, 0)
 
+            def draw_base_buffer(self, painter) -> None:
+                painter.drawImage(0, 0, self._buffer)
+
+            def buffer_matches_viewport(self, size, dpr) -> bool:
+                return self._buffer.size() == size
+
             def allocate_buffers(self, size, dpr):
                 self.allocations += 1
 
@@ -1103,6 +1115,12 @@ def test_presenter_paint_restores_transform_before_tool_overlay(monkeypatch, qap
 
             def get_subpixel_pan_offset(self) -> QPointF:
                 return QPointF(0.5, 0.25)
+
+            def draw_base_buffer(self, painter) -> None:
+                painter.drawImage(0, 0, self._buffer)
+
+            def buffer_matches_viewport(self, size, dpr) -> bool:
+                return True
 
             def allocate_buffers(self, size, dpr):
                 self._buffer = _make_image(

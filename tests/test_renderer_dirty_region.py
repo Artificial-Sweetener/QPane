@@ -134,11 +134,8 @@ def test_mark_dirty_whole_view_sentinel():
 
 def test_redraw_base_image_buffer_resets_buffer_pan_when_full_dirty():
     qpane_rect = QRect(0, 0, 32, 32)
-    renderer = Renderer(types.SimpleNamespace())
-    renderer._base_image_buffer = QImage(
-        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
-    )
-    renderer._base_image_buffer.fill(Qt.transparent)
+    renderer = Renderer(_DummyRendererHost(qpane_rect))
+    renderer.allocate_buffers(qpane_rect.size(), 1.0)
     renderer._buffer_pan = QPointF(-12.0, 7.0)
     renderer._subpixel_pan_offset = QPointF(0.6, 0.4)
     plan = _make_render_plan(qpane_rect)
@@ -151,11 +148,8 @@ def test_redraw_base_image_buffer_resets_buffer_pan_when_full_dirty():
 def test_redraw_base_image_buffer_resets_buffer_pan_for_full_dirty_sentinel():
     """Full-view sentinel redraws should reset the buffer's pan identity."""
     qpane_rect = QRect(0, 0, 32, 32)
-    renderer = Renderer(types.SimpleNamespace())
-    renderer._base_image_buffer = QImage(
-        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
-    )
-    renderer._base_image_buffer.fill(Qt.transparent)
+    renderer = Renderer(_DummyRendererHost(qpane_rect))
+    renderer.allocate_buffers(qpane_rect.size(), 1.0)
     renderer._buffer_pan = QPointF(-64.0, 608.0)
     renderer._subpixel_pan_offset = QPointF(-0.69, 0.69)
     plan = _make_render_plan(qpane_rect)
@@ -167,11 +161,8 @@ def test_redraw_base_image_buffer_resets_buffer_pan_for_full_dirty_sentinel():
 
 def test_redraw_base_image_buffer_keeps_buffer_pan_when_partial_dirty():
     qpane_rect = QRect(0, 0, 32, 32)
-    renderer = Renderer(types.SimpleNamespace())
-    renderer._base_image_buffer = QImage(
-        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
-    )
-    renderer._base_image_buffer.fill(Qt.transparent)
+    renderer = Renderer(_DummyRendererHost(qpane_rect))
+    renderer.allocate_buffers(qpane_rect.size(), 1.0)
     original_buffer_pan = QPointF(-12.0, 7.0)
     renderer._buffer_pan = QPointF(original_buffer_pan)
     renderer._subpixel_pan_offset = QPointF(0.6, 0.4)

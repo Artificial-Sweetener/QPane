@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QSize
+from PySide6.QtCore import QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QImage, QPainter
 
 
@@ -77,6 +77,38 @@ def rendered_widget_frame(base_buffer: QImage, subpixel_offset: QPointF) -> QIma
             safe_dpr = dpr if dpr > 0 else 1.0
             painter.translate(subpixel_offset / safe_dpr)
         painter.drawImage(0, 0, base_buffer)
+    finally:
+        painter.end()
+    return frame
+
+
+def rendered_overscanned_widget_frame(
+    base_buffer: QImage,
+    subpixel_offset: QPointF,
+    viewport_size: QSize,
+    overscan_margin: int,
+) -> QImage:
+    """Return the widget-visible crop from an overscanned renderer buffer."""
+    frame = QImage(viewport_size, QImage.Format_ARGB32_Premultiplied)
+    frame.setDevicePixelRatio(base_buffer.devicePixelRatio())
+    frame.fill(0)
+    dpr = base_buffer.devicePixelRatio()
+    safe_dpr = dpr if dpr > 0 else 1.0
+    painter = QPainter(frame)
+    try:
+        source_rect = QRectF(
+            overscan_margin - subpixel_offset.x(),
+            overscan_margin - subpixel_offset.y(),
+            float(viewport_size.width()),
+            float(viewport_size.height()),
+        )
+        destination_rect = QRectF(
+            0.0,
+            0.0,
+            viewport_size.width() / safe_dpr,
+            viewport_size.height() / safe_dpr,
+        )
+        painter.drawImage(destination_rect, base_buffer, source_rect)
     finally:
         painter.end()
     return frame

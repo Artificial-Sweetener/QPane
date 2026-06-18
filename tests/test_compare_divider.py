@@ -29,6 +29,7 @@ import qpane
 from qpane import ComparisonOrientation, ExtensionTool, QPane
 from qpane.rendering.clip_geometry import projected_comparison_boundary
 from qpane.scene.render_plan import SceneRenderPlan
+from tests.helpers.render_compare import rendered_overscanned_widget_frame
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -110,9 +111,15 @@ def _render_buffer(viewer: QPane) -> tuple[SceneRenderPlan, QImage]:
     plan = viewer.view().calculateRenderPlan(is_blank=False)
     assert plan is not None
     viewer.view().renderer.paint(plan)
-    buffer = viewer.view().renderer.get_base_buffer()
+    renderer = viewer.view().renderer
+    buffer = renderer.get_base_buffer()
     assert buffer is not None
-    return plan, buffer.copy()
+    return plan, rendered_overscanned_widget_frame(
+        buffer.copy(),
+        renderer.get_subpixel_pan_offset(),
+        renderer._viewport_physical_size,
+        renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+    )
 
 
 def _first_blue_x(buffer: QImage, y: int) -> int | None:

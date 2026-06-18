@@ -28,6 +28,7 @@ from qpane.scene.identity import SceneLayerTileKey, default_catalog_asset_key
 from qpane.scene.model import ClipCoordinateSpace, LayerKind
 from qpane.scene.render_plan import RasterLayerRenderItem, RenderStrategy
 from qpane.scene.sources import CatalogImageSource
+from tests.helpers.render_compare import rendered_overscanned_widget_frame
 
 
 def _solid_image(
@@ -626,10 +627,17 @@ def test_compare_split_clips_rendered_pixels(qapp) -> None:
         plan = qpane.view().calculateRenderPlan(is_blank=False)
         assert plan is not None
 
-        qpane.view().renderer.paint(plan)
-        buffer = qpane.view().renderer.get_base_buffer()
+        renderer = qpane.view().renderer
+        renderer.paint(plan)
+        buffer = renderer.get_base_buffer()
 
         assert buffer is not None
+        buffer = rendered_overscanned_widget_frame(
+            buffer.copy(),
+            renderer.get_subpixel_pan_offset(),
+            renderer._viewport_physical_size,
+            renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+        )
         assert buffer.pixelColor(25, 50) == QColor(Qt.red)
         assert buffer.pixelColor(75, 50) == QColor(Qt.blue)
     finally:
@@ -660,10 +668,17 @@ def test_compare_catalog_image_uses_scene_placement(qapp) -> None:
         plan = qpane.view().calculateRenderPlan(is_blank=False)
         assert plan is not None
 
-        qpane.view().renderer.paint(plan)
-        buffer = qpane.view().renderer.get_base_buffer()
+        renderer = qpane.view().renderer
+        renderer.paint(plan)
+        buffer = renderer.get_base_buffer()
 
         assert buffer is not None
+        buffer = rendered_overscanned_widget_frame(
+            buffer.copy(),
+            renderer.get_subpixel_pan_offset(),
+            renderer._viewport_physical_size,
+            renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+        )
         assert buffer.pixelColor(25, 50) == QColor(Qt.red)
         assert buffer.pixelColor(75, 50) == QColor(Qt.blue)
         assert buffer.pixelColor(90, 50) == QColor(Qt.blue)

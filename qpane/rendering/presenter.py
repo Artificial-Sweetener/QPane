@@ -304,17 +304,8 @@ class RenderingPresenter:
         else:
             self._last_scroll_reuse_signature = None
         painter = QPainter(self._qpane)
-        transform_applied = False
         try:
-            base_buffer = self.renderer.get_base_buffer()
-            if base_buffer:
-                offset = self.renderer.get_subpixel_pan_offset()
-                if offset != QPointF(0, 0):
-                    context = CoordinateContext(self._qpane)
-                    logical_offset = context.physical_to_logical(offset)
-                    painter.translate(logical_offset)
-                    transform_applied = True
-                painter.drawImage(0, 0, base_buffer)
+            self.renderer.draw_base_buffer(painter)
             self._draw_content_overlays(
                 painter,
                 render_plan,
@@ -327,8 +318,6 @@ class RenderingPresenter:
                 active_scene_overlays,
                 overlays_suspended=overlays_suspended,
             )
-            if transform_applied:
-                painter.resetTransform()
             if draw_tool_overlay and not is_blank:
                 draw_tool_overlay(painter)
         finally:
@@ -589,7 +578,10 @@ class RenderingPresenter:
             self.allocate_buffers()
             return
         expected_size = self._qpane_physical_size()
-        if base_buffer.size() != expected_size:
+        if not self.renderer.buffer_matches_viewport(
+            expected_size,
+            float(self._qpane.devicePixelRatioF()),
+        ):
             self.allocate_buffers()
 
     @staticmethod

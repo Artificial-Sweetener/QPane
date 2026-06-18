@@ -382,6 +382,12 @@ def _assert_overlay_draw_invoked_during_paint(qpane: QPane, monkeypatch) -> None
         def get_subpixel_pan_offset(self):
             return QPointF(0, 0)
 
+        def draw_base_buffer(self, painter):
+            painter.drawImage(0, 0, self._image)
+
+        def buffer_matches_viewport(self, size, dpr):
+            return self._image.size() == size
+
         def allocate_buffers(self, size, dpr):
             self._image = QImage(size.width(), size.height(), QImage.Format_ARGB32)
             self._image.fill(Qt.black)
@@ -781,6 +787,12 @@ def _assert_qpane_paint_event_triggers_alignment(qpane: QPane, monkeypatch) -> N
 
         def get_subpixel_pan_offset(self):
             return QPointF(0, 0)
+
+        def draw_base_buffer(self, painter):
+            painter.drawImage(0, 0, self._image)
+
+        def buffer_matches_viewport(self, size, dpr):
+            return True
 
     original_renderer = presenter.renderer
     presenter.renderer = DummyRenderer()

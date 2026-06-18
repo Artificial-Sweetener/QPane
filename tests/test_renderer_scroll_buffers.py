@@ -42,7 +42,7 @@ from qpane.scene.sources import MaskLayerSource
 from tests.helpers.render_compare import (
     assert_images_match,
     checker_image,
-    rendered_widget_frame,
+    rendered_overscanned_widget_frame,
 )
 from tests.helpers.render_plan import make_render_plan
 
@@ -102,7 +102,12 @@ def _render_clean_frame(qpane: QPane, pan: QPointF) -> QImage:
     renderer.paint(plan)
     buffer = renderer.get_base_buffer()
     assert buffer is not None
-    return rendered_widget_frame(QImage(buffer), renderer.get_subpixel_pan_offset())
+    return rendered_overscanned_widget_frame(
+        QImage(buffer),
+        renderer.get_subpixel_pan_offset(),
+        renderer._viewport_physical_size,
+        renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+    )
 
 
 def _render_scrolled_frame(
@@ -124,19 +129,42 @@ def _render_scrolled_frame(
     assert renderer.tryScrollBuffers(target_pan) is True
     buffer = renderer.get_base_buffer()
     assert buffer is not None
-    return rendered_widget_frame(QImage(buffer), renderer.get_subpixel_pan_offset())
+    return rendered_overscanned_widget_frame(
+        QImage(buffer),
+        renderer.get_subpixel_pan_offset(),
+        renderer._viewport_physical_size,
+        renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+    )
 
 
-def _make_qpane_with_checker_image(qapp, *, size: int = 256) -> QPane:
+def _make_qpane_with_checker_image(
+    qapp,
+    *,
+    size: int = 256,
+    dpr: float = 1.0,
+) -> QPane:
     """Return a QPane containing one high-contrast image."""
     qpane = QPane(features=())
     qpane.resize(128, 128)
+    qpane.devicePixelRatioF = lambda: dpr  # type: ignore[method-assign]
     image = checker_image(QRect(0, 0, size, size).size())
     image_id = uuid.uuid4()
     qpane.setImagesByID(QPane.imageMapFromLists([image], [None], [image_id]), image_id)
     qpane.setZoom1To1()
     qapp.processEvents()
     return qpane
+
+
+def _assert_edges_are_covered(image: QImage) -> None:
+    """Assert that every visible edge pixel has rendered source coverage."""
+    width = image.width()
+    height = image.height()
+    for x in range(width):
+        assert image.pixelColor(x, 0).alpha() == 255
+        assert image.pixelColor(x, height - 1).alpha() == 255
+    for y in range(height):
+        assert image.pixelColor(0, y).alpha() == 255
+        assert image.pixelColor(width - 1, y).alpha() == 255
 
 
 def test_try_scroll_buffers_uses_qpane_render_plan(qpane_with_image, monkeypatch):
@@ -242,6 +270,36 @@ def test_default_scene_scroll_repair_matches_full_redraw(qapp) -> None:
             target_pan=target_pan,
         )
         assert_images_match(actual, expected)
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0, 2.5, 3.0])
+@pytest.mark.parametrize(
+    "target_pan",
+    [
+        QPointF(0.5, 0.0),
+        QPointF(-0.75, 0.0),
+        QPointF(0.0, 0.5),
+        QPointF(0.0, -0.75),
+        QPointF(0.5, 0.5),
+    ],
+)
+def test_fractional_scroll_reuse_covers_viewport_edges(
+    qapp,
+    dpr: float,
+    target_pan: QPointF,
+) -> None:
+    """Fractional scroll reuse should not expose uncovered edge strips."""
+    qpane = _make_qpane_with_checker_image(qapp, size=1024, dpr=dpr)
+    try:
+        actual = _render_scrolled_frame(
+            qpane,
+            start_pan=QPointF(0.0, 0.0),
+            target_pan=target_pan,
+        )
+        _assert_edges_are_covered(actual)
     finally:
         qpane.deleteLater()
         qapp.processEvents()

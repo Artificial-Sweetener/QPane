@@ -147,6 +147,14 @@ def test_placeholder_scene_plan_is_painted(qapp, tmp_path: Path) -> None:
             """Return no scroll reuse offset."""
             return QPointF(0.0, 0.0)
 
+        def draw_base_buffer(self, painter) -> None:
+            """Draw the test buffer for presenter compositing."""
+            painter.drawImage(0, 0, self.buffer)
+
+        def buffer_matches_viewport(self, size, _dpr) -> bool:
+            """Return whether the test buffer matches the requested size."""
+            return self.buffer.size() == size
+
         def allocate_buffers(self, size, _dpr) -> None:
             """Resize the test buffer when the presenter requests allocation."""
             self.buffer = QImage(size, QImage.Format_ARGB32_Premultiplied)

@@ -38,6 +38,7 @@ from qpane import (
 )
 from qpane.scene.identity import default_catalog_asset_key
 from qpane.scene.render_plan import RasterLayerRenderItem, RenderStrategy
+from tests.helpers.render_compare import rendered_overscanned_widget_frame
 
 
 def _solid_image(
@@ -231,9 +232,16 @@ def test_compose_scene_renders_catalog_layers_and_reuses_pyramids(qapp) -> None:
         ]
 
         qpane.view().allocate_buffers()
-        qpane.view().renderer.paint(plan)
-        buffer = qpane.view().renderer.get_base_buffer()
+        renderer = qpane.view().renderer
+        renderer.paint(plan)
+        buffer = renderer.get_base_buffer()
         assert buffer is not None
+        buffer = rendered_overscanned_widget_frame(
+            buffer.copy(),
+            renderer.get_subpixel_pan_offset(),
+            renderer._viewport_physical_size,
+            renderer._BUFFER_OVERSCAN_PHYSICAL_PX,
+        )
         assert buffer.pixelColor(50, 50) == QColor(Qt.red)
         assert buffer.pixelColor(150, 50) == QColor(Qt.blue)
     finally:

@@ -33,6 +33,7 @@ class _StubQPane:
     def __init__(self, size: QSize):
         self._size = size
         self.viewport = types.SimpleNamespace(zoom=1.0, pan=QPointF(0.0, 0.0))
+        self._view = types.SimpleNamespace(viewport=self.viewport)
         self.original_image = QImage(size, QImage.Format_ARGB32_Premultiplied)
         self.original_image.fill(Qt.white)
 
@@ -41,6 +42,9 @@ class _StubQPane:
 
     def size(self) -> QSize:
         return self._size
+
+    def view(self):
+        return self._view
 
 
 def _make_plan(qpane_rect: QRect, strategy: RenderStrategy):
@@ -70,10 +74,7 @@ def test_redraw_base_image_buffer_respects_strategy(
     qpane_rect = QRect(0, 0, 40, 40)
     qpane = _StubQPane(qpane_rect.size())
     renderer = Renderer(qpane)
-    renderer._base_image_buffer = QImage(
-        qpane_rect.size(), QImage.Format_ARGB32_Premultiplied
-    )
-    renderer._base_image_buffer.fill(Qt.transparent)
+    renderer.allocate_buffers(qpane_rect.size(), 1.0)
     plan = _make_plan(qpane_rect, strategy=strategy)
     dirty_region = QRegion(qpane_rect)
     direct_calls = []

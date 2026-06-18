@@ -59,6 +59,8 @@ class RendererMetrics:
 class Renderer:
     """Own the offscreen buffers plus reuse heuristics for the QPane widget."""
 
+    _BUFFER_OVERSCAN_PHYSICAL_PX = 2
+
     def __init__(self, qpane: "QPane"):
         """Bind rendering to `qpane` while tracking buffer reuse health."""
         self._qpane = qpane
@@ -67,6 +69,7 @@ class Renderer:
         self._dirty_region = QRegion()
         self._buffer_pan = QPointF(0, 0)
         self._subpixel_pan_offset = QPointF(0, 0)
+        self._viewport_physical_size = QSize()
         self._scroll_temp: QImage | None = None
         self._last_paint_duration_ms = 0.0
         self._paint_duration_sum_ms = 0.0
@@ -110,12 +113,27 @@ class Renderer:
 
     def allocate_buffers(self, physical_size: QSize, dpr: float):
         """Allocate and clear the base buffer sized to the physical viewport."""
-        self._base_image_buffer = self._allocate_dpi_buffer(physical_size, dpr)
+        self._viewport_physical_size = QSize(physical_size)
+        self._base_image_buffer = self._allocate_dpi_buffer(
+            self._overscanned_buffer_size(physical_size),
+            dpr,
+        )
         self._base_image_buffer.fill(Qt.transparent)
         self._scroll_temp = None
         self._base_buffer_allocations += 1
         # Mark the entire view as dirty since the buffers are new.
         self.markDirty()
+
+    def buffer_matches_viewport(self, physical_size: QSize, dpr: float) -> bool:
+        """Return True when the allocated backing store matches the viewport."""
+        if self._base_image_buffer is None:
+            return False
+        return (
+            self._viewport_physical_size == physical_size
+            and self._base_image_buffer.devicePixelRatio() == dpr
+            and self._base_image_buffer.size()
+            == self._overscanned_buffer_size(physical_size)
+        )
 
     def markDirty(self, dirty_rect: QRect | QRectF | QRegion | None = None):
         """Mark a region dirty for the next render pass; None targets the full viewport."""
@@ -224,6 +242,21 @@ class Renderer:
         """Return the subpixel offset applied when scrolling reused buffers."""
         return self._subpixel_pan_offset
 
+    def draw_base_buffer(self, painter: QPainter) -> None:
+        """Draw the viewport crop from the overscanned base buffer."""
+        if self._base_image_buffer is None or self._viewport_physical_size.isEmpty():
+            return
+        margin = self._BUFFER_OVERSCAN_PHYSICAL_PX
+        source_rect = QRectF(
+            margin - self._subpixel_pan_offset.x(),
+            margin - self._subpixel_pan_offset.y(),
+            float(self._viewport_physical_size.width()),
+            float(self._viewport_physical_size.height()),
+        )
+        painter.drawImage(
+            QRectF(self.qpane.rect()), self._base_image_buffer, source_rect
+        )
+
     def snapshot_metrics(self) -> RendererMetrics:
         """Return current renderer reuse counters for diagnostics displays."""
         return RendererMetrics(
@@ -262,7 +295,10 @@ class Renderer:
         context = CoordinateContext(self.qpane)
         # Map PHYSICAL buffer coordinates -> LOGICAL qpane space before projecting
         # through the inverted transform into SOURCE image space.
-        buffer_rect_log = context.physical_to_logical(buffer_rect_phys)
+        buffer_rect_log = self._buffer_physical_to_widget_logical(
+            buffer_rect_phys,
+            context,
+        )
         # Map the entire logical buffer rect back to the source image space at once.
         # This is more numerically stable than mapping individual points.
         return inv_transform.mapRect(buffer_rect_log)
@@ -281,15 +317,20 @@ class Renderer:
         painter = QPainter(self._base_image_buffer)
         context = CoordinateContext(self.qpane)
         try:
+            self._translate_to_widget_origin(painter, context)
             clip_region = QRegion()
             for rect in repair_rects:
-                logical_rect = context.physical_to_logical(QRectF(rect)).toRect()
+                logical_rect = self._buffer_physical_to_widget_logical(
+                    QRectF(rect),
+                    context,
+                ).toAlignedRect()
                 clip_region = clip_region.united(QRegion(logical_rect))
             painter.setClipRegion(clip_region)
             painter.setCompositionMode(QPainter.CompositionMode_Source)
             for rect in repair_rects:
                 painter.fillRect(
-                    context.physical_to_logical(QRectF(rect)), Qt.transparent
+                    self._buffer_physical_to_widget_logical(QRectF(rect), context),
+                    Qt.transparent,
                 )
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
             self._draw_visible_scene_items(painter, plan)
@@ -312,6 +353,7 @@ class Renderer:
         painter = QPainter(self._base_image_buffer)
         context = CoordinateContext(self.qpane)
         try:
+            self._translate_to_widget_origin(painter, context)
             clip_region = self._logical_region_for_physical_rects(
                 repair_rects,
                 context,
@@ -320,7 +362,7 @@ class Renderer:
             painter.setCompositionMode(QPainter.CompositionMode_Source)
             for rect in repair_rects:
                 painter.fillRect(
-                    context.physical_to_logical(QRectF(rect)),
+                    self._buffer_physical_to_widget_logical(QRectF(rect), context),
                     Qt.transparent,
                 )
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
@@ -331,7 +373,7 @@ class Renderer:
                         QPainter.RenderHint.SmoothPixmapTransform,
                         True,
                     )
-                painter.setTransform(base_item.transform)
+                painter.setTransform(base_item.transform, True)
                 self._draw_raster_source_strips(
                     painter,
                     base_item,
@@ -358,11 +400,12 @@ class Renderer:
             return True
         painter = QPainter(self._base_image_buffer)
         try:
+            self._translate_to_widget_origin(painter, context)
             painter.setClipRegion(repair_region)
             painter.setCompositionMode(QPainter.CompositionMode_Source)
             for rect in repair_rects:
                 painter.fillRect(
-                    context.physical_to_logical(QRectF(rect)),
+                    self._buffer_physical_to_widget_logical(QRectF(rect), context),
                     Qt.transparent,
                 )
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
@@ -376,7 +419,7 @@ class Renderer:
                     continue
                 painter.save()
                 try:
-                    painter.setTransform(item.transform)
+                    painter.setTransform(item.transform, True)
                     self._apply_layer_clip(painter, plan, item)
                     if isinstance(item, RasterLayerRenderItem):
                         if not self._draw_raster_source_strips(
@@ -401,15 +444,18 @@ class Renderer:
         finally:
             painter.end()
 
-    @staticmethod
     def _logical_region_for_physical_rects(
+        self,
         repair_rects: list[QRect],
         context: CoordinateContext,
     ) -> QRegion:
         """Return a logical clip region for physical buffer repair rectangles."""
         clip_region = QRegion()
         for rect in repair_rects:
-            logical_rect = context.physical_to_logical(QRectF(rect)).toRect()
+            logical_rect = self._buffer_physical_to_widget_logical(
+                QRectF(rect),
+                context,
+            ).toAlignedRect()
             clip_region = clip_region.united(QRegion(logical_rect))
         return clip_region
 
@@ -454,7 +500,7 @@ class Renderer:
         )
         for rect in repair_rects:
             source_rect = inverse.mapRect(
-                context.physical_to_logical(QRectF(rect))
+                self._buffer_physical_to_widget_logical(QRectF(rect), context)
             ).intersected(source_bounds)
             if source_rect.isEmpty():
                 continue
@@ -484,7 +530,7 @@ class Renderer:
         )
         for rect in repair_rects:
             source_rect = inverse.mapRect(
-                context.physical_to_logical(QRectF(rect))
+                self._buffer_physical_to_widget_logical(QRectF(rect), context)
             ).intersected(source_bounds)
             if source_rect.isEmpty():
                 continue
@@ -527,12 +573,18 @@ class Renderer:
         qpane_region = QRegion(qpane_rect)
         full_viewport_dirty = dirty_region.intersected(qpane_region) == qpane_region
         if full_viewport_dirty:
+            dirty_region = dirty_region.united(self._widget_logical_buffer_region())
+        if full_viewport_dirty:
             self._full_redraws += 1
         else:
             self._partial_redraws += 1
         self._current_render_plan = plan
         buffer_painter = QPainter(self._base_image_buffer)
         try:
+            self._translate_to_widget_origin(
+                buffer_painter,
+                CoordinateContext(self.qpane),
+            )
             base_only_item = self._base_only_raster_item(plan)
             if base_only_item is not None:
                 self._redraw_base_only_dirty_region(
@@ -636,7 +688,7 @@ class Renderer:
         try:
             if item.render_hint_enabled:
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            painter.setTransform(item.transform)
+            painter.setTransform(item.transform, True)
             if item.strategy == RenderStrategy.DIRECT:
                 self._draw_direct_view(painter, item)
             elif item.strategy == RenderStrategy.TILE:
@@ -679,7 +731,7 @@ class Renderer:
         """Draw one raster image item."""
         if item.render_hint_enabled:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.setTransform(item.transform)
+        painter.setTransform(item.transform, True)
         self._apply_layer_clip(painter, plan, item)
         if item.strategy == RenderStrategy.DIRECT:
             self._draw_direct_view(painter, item)
@@ -695,7 +747,7 @@ class Renderer:
         """Draw one colorized mask item."""
         if item.render_hint_enabled:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.setTransform(item.transform)
+        painter.setTransform(item.transform, True)
         self._apply_layer_clip(painter, plan, item)
         painter.setOpacity(item.descriptor.opacity)
         painter.drawPixmap(0, 0, item.pixmap)
@@ -850,6 +902,54 @@ class Renderer:
     def _draw_direct_view(self, painter: QPainter, item: RasterLayerRenderItem):
         """Draw the source image directly with no tiling helpers."""
         painter.drawImage(0, 0, item.source_image)
+
+    @classmethod
+    def _overscanned_buffer_size(cls, viewport_size: QSize) -> QSize:
+        """Return the backing-buffer size including physical overscan."""
+        margin = cls._BUFFER_OVERSCAN_PHYSICAL_PX * 2
+        return QSize(
+            max(0, viewport_size.width() + margin),
+            max(0, viewport_size.height() + margin),
+        )
+
+    def _buffer_margin_logical(self, context: CoordinateContext) -> QPointF:
+        """Return the overscan margin in widget logical units."""
+        margin = float(self._BUFFER_OVERSCAN_PHYSICAL_PX)
+        return context.physical_to_logical(QPointF(margin, margin))
+
+    def _translate_to_widget_origin(
+        self,
+        painter: QPainter,
+        context: CoordinateContext,
+    ) -> None:
+        """Move widget logical coordinates to their overscanned buffer origin."""
+        painter.translate(self._buffer_margin_logical(context))
+
+    def _buffer_physical_to_widget_logical(
+        self,
+        rect: QRectF,
+        context: CoordinateContext,
+    ) -> QRectF:
+        """Convert a physical backing-buffer rect into widget logical coordinates."""
+        margin = float(self._BUFFER_OVERSCAN_PHYSICAL_PX)
+        viewport_rect = QRectF(
+            rect.x() - margin,
+            rect.y() - margin,
+            rect.width(),
+            rect.height(),
+        )
+        return context.physical_to_logical(viewport_rect)
+
+    def _widget_logical_buffer_region(self) -> QRegion:
+        """Return the full overscanned backing store in widget logical coordinates."""
+        if self._base_image_buffer is None:
+            return QRegion()
+        context = CoordinateContext(self.qpane)
+        rect = self._buffer_physical_to_widget_logical(
+            QRectF(self._base_image_buffer.rect()),
+            context,
+        )
+        return QRegion(rect.toAlignedRect())
 
     def _mark_diagnostics_dirty(self) -> None:
         """Mark render diagnostics dirty on the QPane if available."""
